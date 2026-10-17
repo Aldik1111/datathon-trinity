@@ -42,7 +42,7 @@ def _render_violation(event: Any, index: int) -> None:
         st.write(description)
 
     rule = event.get("rule")
-    if isinstance(rule, dict):
+    if event.get("rule_status") == "verified" and isinstance(rule, dict):
         rule_title = rule.get("title")
         section = rule.get("section")
         url = rule.get("url")
@@ -53,6 +53,10 @@ def _render_violation(event: Any, index: int) -> None:
             elif text:
                 st.caption(f"Источник: {text}")
         st.caption("Связь события с указанной нормой и её применимость требуют ручной проверки.")
+        if rule.get("checked_at"):
+            st.caption(f"Источник проверен: {rule['checked_at']}")
+        if rule.get("limitations"):
+            st.caption(f"Ограничения: {rule['limitations']}")
     else:
         st.warning("Нормативное основание не подтверждено.")
 
@@ -82,7 +86,10 @@ def _render_result(job: dict[str, Any]) -> None:
     violations = job.get("violations", [])
 
     if verdict == "violation":
-        st.error("Обнаружены признаки возможных нарушений.")
+        if job.get("demo"):
+            st.info("Тестовый результат: пример события для проверки интерфейса.")
+        else:
+            st.error("Обнаружены признаки возможных нарушений.")
         if not isinstance(violations, list) or not violations:
             st.info("Сервис не приложил описание событий.")
         else:
@@ -90,7 +97,10 @@ def _render_result(job: dict[str, Any]) -> None:
                 with st.container(border=True):
                     _render_violation(event, index)
     elif verdict == "no_violation":
-        st.success("Нарушение не обнаружено.")
+        if job.get("demo"):
+            st.info("Тестовый результат: пример ответа без событий.")
+        else:
+            st.success("Нарушение не обнаружено.")
     else:
         st.error("API вернул неизвестный итоговый статус.")
 
@@ -151,7 +161,8 @@ def main() -> None:
             st.error("Сначала выберите видеофайл .mov.")
         else:
             try:
-                response = submit_video(load_settings(), uploaded_file.name, uploaded_file.getvalue())
+                with st.spinner("Видео загружается в сервис…"):
+                    response = submit_video(load_settings(), uploaded_file.name, uploaded_file.getvalue())
                 job_id = response.get("job_id")
                 if not isinstance(job_id, str) or not job_id:
                     raise APIClientError("API не вернул идентификатор задачи.")
