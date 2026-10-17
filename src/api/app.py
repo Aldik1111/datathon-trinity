@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import multiprocessing
+import os
 import sqlite3
 import tempfile
 import threading
@@ -128,6 +129,16 @@ def _initialize(settings: Settings) -> None:
     for row in interrupted:
         with suppress(OSError):
             Path(row["video_path"]).unlink()
+    # A crash during upload can leave a file before its SQLite row is inserted.
+    # This directory is service-owned; only generated UUID filenames are removed.
+    for path in settings.upload_dir.glob("*.mov"):
+        try:
+            if str(uuid.UUID(path.stem)) != path.stem:
+                continue
+        except ValueError:
+            continue
+        with suppress(OSError):
+            path.unlink()
 
 
 def _cleanup_expired(settings: Settings) -> None:
@@ -144,6 +155,11 @@ def _cleanup_expired(settings: Settings) -> None:
 
 def _child_analyze(send_conn: Any, video_path: str, settings: Settings) -> None:
     """Run analysis in an isolated child so timeout termination is reliable."""
+    # Native decoders and model libraries can print input paths or secrets.
+    # Only fixed, sanitized errors cross the pipe into API logs/responses.
+    with open(os.devnull, "w") as sink:
+        os.dup2(sink.fileno(), 1)
+        os.dup2(sink.fileno(), 2)
     try:
         # Adapter import is delayed so API startup and health checks remain usable
         # when an optional model dependency is unavailable.
@@ -222,6 +238,9 @@ def _run_child(
         if process.is_alive():
             process.terminate()
             process.join(timeout=3)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=3)
 
 
 def _public_result(job_id: str, result_json: str | None, demo: int) -> dict[str, Any]:
@@ -388,6 +407,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         api_key=configured.api_key,
         max_body_bytes=configured.max_upload_mb * 1024 * 1024,
     )
+
+    @app.get("/healthz", include_in_schema=False)
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
 
     def require_key(x_api_key: str | None) -> None:
         if x_api_key is None or not hmac.compare_digest(
