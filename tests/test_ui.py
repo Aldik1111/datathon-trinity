@@ -109,6 +109,7 @@ class StreamlitAppTests(unittest.TestCase):
                         {"timestamp_sec": 66.0, "image_base64": jpeg},
                     ],
                     "rule": {"title": "Правило", "url": "https://example.test/rule", "section": "п. 2"},
+                    "rule_status": "verified",
                 },
             ],
         }
@@ -127,6 +128,26 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertIn("event_two", rendered)
         self.assertEqual(len(at.image), 3)
         self.assertIn("00:44.2", " ".join(caption for image in at.image for caption in image.captions))
+
+    @patch("src.ui.client.get_job")
+    @patch("src.ui.client.submit_video")
+    def test_done_demo_never_claims_detection_or_unverified_rule(self, submit, get_job):
+        submit.return_value = {"job_id": "demo", "status": "processing", "demo": True}
+        get_job.return_value = {
+            "job_id": "demo", "status": "done", "demo": True, "verdict": "violation",
+            "violations": [{"type": "test", "timecode_sec": 0, "description": "Synthetic",
+                            "evidence_frames": [], "rule_status": "unverified",
+                            "rule": {"title": "UNVERIFIED_SOURCE", "url": "https://example.test"}}],
+        }
+        with patch.dict(os.environ, {"API_KEY": "app-test-secret"}):
+            at = AppTest.from_file(self.app_path, default_timeout=10).run()
+            self._submit(at)
+        self.assertFalse(at.exception)
+        rendered = "\n".join(str(e.value) for e in at if hasattr(e, "value"))
+        self.assertIn("Тестовый результат", rendered)
+        self.assertIn("Нормативное основание не подтверждено", rendered)
+        self.assertNotIn("Обнаружены признаки", rendered)
+        self.assertNotIn("UNVERIFIED_SOURCE", rendered)
 
     @patch("src.ui.client.get_job")
     @patch("src.ui.client.submit_video")
