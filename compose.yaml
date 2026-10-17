@@ -1,0 +1,67 @@
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    init: true
+    restart: unless-stopped
+    environment:
+      API_KEY: ${API_KEY:?Generate .env first}
+      UPLOAD_DIR: /state/uploads
+      API_DB_PATH: /state/jobs.sqlite3
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-100}
+      MAX_PENDING_JOBS: ${MAX_PENDING_JOBS:-2}
+      ANALYZER_MODE: ${ANALYZER_MODE:-demo}
+      ANALYZER_CALLABLE: ${ANALYZER_CALLABLE:-src.vision.analyzer:analyze_video}
+      ANALYZER_TIMEOUT_SEC: ${ANALYZER_TIMEOUT_SEC:-300}
+      JOB_TTL_SEC: ${JOB_TTL_SEC:-86400}
+      RULES_PATH: /app/configs/rules.json
+    ports: ["127.0.0.1:8000:8000"]
+    volumes: ["service-state:/state"]
+    networks: [service]
+    read_only: true
+    tmpfs: ["/tmp:size=512m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 2g
+    pids_limit: 128
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+  ui:
+    build:
+      context: .
+      target: runtime
+    init: true
+    restart: unless-stopped
+    command: ["python", "-m", "streamlit", "run", "src/ui/app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    environment:
+      API_KEY: ${API_KEY:?Generate .env first}
+      API_URL: http://api:8000
+      STREAMLIT_SERVER_MAX_UPLOAD_SIZE: ${MAX_UPLOAD_MB:-100}
+    ports: ["127.0.0.1:8501:8501"]
+    networks: [service]
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+networks:
+  service:
+    internal: true
+volumes:
+  service-state:

@@ -1,0 +1,14 @@
+**
+!requirements.txt
+!requirements-dev.txt
+!src/
+!src/**
+!configs/
+!configs/rules.json
+!.streamlit/
+!.streamlit/config.toml
+!tests/
+!tests/**
+!evaluate.py
+**/__pycache__
+**/*.pyc
