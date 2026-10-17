@@ -42,7 +42,7 @@ def _render_violation(event: Any, index: int) -> None:
         st.write(description)
 
     rule = event.get("rule")
-    if isinstance(rule, dict):
+    if isinstance(rule, dict) and event.get("rule_status") == "verified":
         rule_title = rule.get("title")
         section = rule.get("section")
         url = rule.get("url")
@@ -53,6 +53,8 @@ def _render_violation(event: Any, index: int) -> None:
             elif text:
                 st.caption(f"Источник: {text}")
         st.caption("Связь события с указанной нормой и её применимость требуют ручной проверки.")
+        if rule.get("limitations"):
+            st.caption(str(rule["limitations"]))
     else:
         st.warning("Нормативное основание не подтверждено.")
 
@@ -82,7 +84,10 @@ def _render_result(job: dict[str, Any]) -> None:
     violations = job.get("violations", [])
 
     if verdict == "violation":
-        st.error("Обнаружены признаки возможных нарушений.")
+        if job.get("demo"):
+            st.info("Тестовая карточка: распознавание нарушений не выполнялось.")
+        else:
+            st.error("Обнаружены признаки возможных нарушений.")
         if not isinstance(violations, list) or not violations:
             st.info("Сервис не приложил описание событий.")
         else:
@@ -90,7 +95,10 @@ def _render_result(job: dict[str, Any]) -> None:
                 with st.container(border=True):
                     _render_violation(event, index)
     elif verdict == "no_violation":
-        st.success("Нарушение не обнаружено.")
+        if job.get("demo"):
+            st.info("Тестовый отрицательный ответ: распознавание не выполнялось.")
+        else:
+            st.success("Нарушение не обнаружено.")
     else:
         st.error("API вернул неизвестный итоговый статус.")
 
@@ -122,6 +130,14 @@ def _job_fragment() -> None:
                 st.session_state.job_error = "API вернул неизвестное состояние задачи."
             status = st.session_state.job_status
         except APIClientError as exc:
+            if exc.status_code in {401, 403, 404}:
+                st.session_state.job_status = "failed"
+                st.session_state.job_error = (
+                    "Результат не найден или срок хранения истёк. Загрузите видео заново."
+                    if exc.status_code == 404 else "Нет доступа к API. Проверьте настройки ключа."
+                )
+                st.error(st.session_state.job_error)
+                return
             # A transient poll failure should not discard the active job.
             _show_demo_warning(bool(st.session_state.get("job_data", {}).get("demo", False)))
             st.warning(str(exc))

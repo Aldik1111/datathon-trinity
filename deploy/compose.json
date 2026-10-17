@@ -1,0 +1,65 @@
+{
+  "name": "trinity-service",
+  "services": {
+    "api": {
+      "build": {"context": ".."},
+      "image": "trinity-service:local",
+      "init": true,
+      "restart": "unless-stopped",
+      "read_only": true,
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "pids_limit": 128,
+      "mem_limit": "2g",
+      "cpus": 2,
+      "stop_grace_period": "15s",
+      "environment": {
+        "API_KEY_FILE": "/run/secrets/api_key",
+        "ANALYZER_MODE": "${ANALYZER_MODE:-demo}",
+        "ANALYZER_CALLABLE": "${ANALYZER_CALLABLE:-src.vision.analyzer:analyze_video}",
+        "MODEL_PATH": "/app/weights/model",
+        "RULES_PATH": "/app/configs/rules.json",
+        "UPLOAD_DIR": "/app/artifacts/uploads",
+        "MAX_UPLOAD_MB": "100",
+        "MAX_PENDING_JOBS": "2",
+        "ANALYZER_TIMEOUT_SEC": "300",
+        "JOB_TTL_SEC": "86400"
+      },
+      "secrets": ["api_key"],
+      "volumes": ["jobs:/app/artifacts"],
+      "tmpfs": ["/tmp:size=256m,mode=1777"],
+      "networks": ["backend"],
+      "ports": ["127.0.0.1:8000:8000"],
+      "healthcheck": {
+        "test": ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3).read()"],
+        "interval": "15s", "timeout": "5s", "retries": 3, "start_period": "20s"
+      },
+      "logging": {"driver": "json-file", "options": {"max-size": "5m", "max-file": "2"}}
+    },
+    "ui": {
+      "image": "trinity-service:local",
+      "init": true,
+      "restart": "unless-stopped",
+      "read_only": true,
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "pids_limit": 128,
+      "mem_limit": "1g",
+      "command": ["python", "-m", "streamlit", "run", "src/ui/app.py", "--server.address", "0.0.0.0", "--server.port", "8501"],
+      "environment": {"API_URL": "http://api:8000", "API_KEY_FILE": "/run/secrets/api_key"},
+      "secrets": ["api_key"],
+      "depends_on": {"api": {"condition": "service_healthy"}},
+      "tmpfs": ["/tmp:size=256m,mode=1777"],
+      "networks": ["backend"],
+      "ports": ["127.0.0.1:8501:8501"],
+      "healthcheck": {
+        "test": ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health',timeout=3).read()"],
+        "interval": "15s", "timeout": "5s", "retries": 3
+      },
+      "logging": {"driver": "json-file", "options": {"max-size": "5m", "max-file": "2"}}
+    }
+  },
+  "secrets": {"api_key": {"file": "../.secrets/api_key"}},
+  "volumes": {"jobs": {}},
+  "networks": {"backend": {"internal": true}}
+}

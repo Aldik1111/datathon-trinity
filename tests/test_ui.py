@@ -109,6 +109,7 @@ class StreamlitAppTests(unittest.TestCase):
                         {"timestamp_sec": 66.0, "image_base64": jpeg},
                     ],
                     "rule": {"title": "Правило", "url": "https://example.test/rule", "section": "п. 2"},
+                    "rule_status": "verified",
                 },
             ],
         }

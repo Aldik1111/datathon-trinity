@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!requirements.txt
+!src/
+!src/**
+!configs/
+!configs/**
+!.streamlit/
+!.streamlit/config.toml
+**/__pycache__/
+**/*.pyc

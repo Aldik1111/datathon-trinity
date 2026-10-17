@@ -1,0 +1,18 @@
+{
+  "services": {
+    "gateway": {
+      "image": "caddy:2-alpine",
+      "restart": "unless-stopped",
+      "environment": {"SITE_DOMAIN": "${SITE_DOMAIN:?Set the approved DNS domain}"},
+      "ports": ["80:80", "443:443"],
+      "volumes": ["./Caddyfile:/etc/caddy/Caddyfile:ro", "caddy_data:/data", "caddy_config:/config"],
+      "secrets": ["ui_users"],
+      "networks": ["backend", "edge"],
+      "depends_on": {"api": {"condition": "service_healthy"}, "ui": {"condition": "service_healthy"}},
+      "logging": {"driver": "json-file", "options": {"max-size": "5m", "max-file": "2"}}
+    }
+  },
+  "secrets": {"ui_users": {"file": "../.secrets/ui_users"}},
+  "networks": {"edge": {}},
+  "volumes": {"caddy_data": {}, "caddy_config": {}}
+}

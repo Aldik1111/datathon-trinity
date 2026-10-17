@@ -17,3 +17,6 @@ uploads/
 *.log
 .env.*
 !.env.example
+.secrets/
+*.pem
+*.key

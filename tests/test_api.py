@@ -161,7 +161,7 @@ class ApiTests(unittest.TestCase):
         active_path = self.settings.upload_dir / "active.mov"
         interrupted_path.write_bytes(b"old upload")
         active_path.write_bytes(b"active upload")
-        old = time.time() - 10_000
+        old = time.time() - self.settings.job_ttl_sec - 10
         db = sqlite3.connect(self.settings.database_path)
         try:
             db.execute(

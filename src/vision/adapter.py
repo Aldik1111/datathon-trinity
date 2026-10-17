@@ -16,6 +16,8 @@ import numpy as np
 
 from .contracts import AnalysisResult, Event, EvidenceFrame
 
+MAX_EVIDENCE_BYTES = 12 * 1024 * 1024
+
 
 class AnalysisError(ValueError):
     """Only fixed, non-sensitive messages should be raised here."""
@@ -77,6 +79,7 @@ def normalize_result(raw: Any, duration: float, rules: dict) -> dict:
     if (verdict == "violation") != bool(events) or len(events) > 100:
         raise AnalysisError("Model verdict is inconsistent with its events")
     violations = []
+    evidence_bytes = 0
     for raw_event in events:
         event = _mapping(raw_event)
         frames = event.get("evidence_frames")
@@ -88,6 +91,9 @@ def normalize_result(raw: Any, duration: float, rules: dict) -> dict:
             jpeg = frame.get("jpeg_bytes")
             if not isinstance(jpeg, bytes) or not 4 <= len(jpeg) <= 4 * 1024 * 1024:
                 raise AnalysisError("Evidence must contain JPEG bytes (at most 4 MiB)")
+            evidence_bytes += len(jpeg)
+            if evidence_bytes > MAX_EVIDENCE_BYTES:
+                raise AnalysisError("Total JPEG evidence exceeds 12 MiB")
             if not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
                 raise AnalysisError("Evidence is not a JPEG image")
             decoded = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)

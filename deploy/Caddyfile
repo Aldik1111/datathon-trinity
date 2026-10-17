@@ -1,0 +1,17 @@
+{$SITE_DOMAIN} {
+    request_body {
+        max_size 105906176
+    }
+    # Keep the original API path and X-API-Key; API authenticates these requests.
+    handle /api/v1/* {
+        reverse_proxy api:8000
+    }
+    # API key lives server-side in Streamlit: protect browser access separately.
+    handle {
+        basic_auth {
+            import /run/secrets/ui_users
+        }
+        reverse_proxy ui:8501
+    }
+    # No access log: do not record keys, request bodies or video descriptions.
+}

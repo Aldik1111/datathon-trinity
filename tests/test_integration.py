@@ -149,6 +149,40 @@ class ServiceIntegrationTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["error"], "Analysis timed out")
 
+    def test_real_contract_multiple_events_and_cleanup(self):
+        settings = self._settings(mode="real", analyzer="tests.fake_analyzers:multiple_events")
+        with TestClient(create_app(settings)) as client:
+            result = self._wait_for_job(client, self._submit(client))
+            self.assertEqual(result["status"], "done")
+            self.assertEqual(len(result["violations"]), 2)
+            for event in result["violations"]:
+                self.assertEqual(event["rule_status"], "unverified")
+                self.assertIsNone(event["rule"])
+                jpeg = base64.b64decode(event["evidence_frames"][0]["image_base64"])
+                self.assertIsNotNone(cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR))
+            self.assertEqual(list(self.upload_dir.glob("*.mov")), [])
+            self.assertEqual(list(self.upload_dir.glob("*.worker.json")), [])
+
+    def test_queued_job_shares_deadline_and_shutdown_cleans_files(self):
+        settings = self._settings(mode="real", analyzer="tests.fake_analyzers:wait_then_no_violation", timeout=1)
+        with TestClient(create_app(settings)) as client:
+            ids = [self._submit(client), self._submit(client)]
+            for job_id in ids:
+                self.assertEqual(self._wait_for_job(client, job_id)["status"], "failed")
+        self.assertEqual(list(self.upload_dir.glob("*.mov")), [])
+        self.assertEqual(list(self.upload_dir.glob("*.worker.json")), [])
+
+    def test_graceful_shutdown_interrupts_active_and_queued_jobs(self):
+        settings = self._settings(mode="real", analyzer="tests.fake_analyzers:wait_then_no_violation")
+        with TestClient(create_app(settings)) as client:
+            ids = [self._submit(client), self._submit(client)]
+        with TestClient(create_app(settings)) as client:
+            for job_id in ids:
+                result = client.get(f"/api/v1/jobs/{job_id}", headers=self.headers).json()
+                self.assertEqual(result["status"], "failed")
+        self.assertEqual(list(self.upload_dir.glob("*.mov")), [])
+        self.assertEqual(list(self.upload_dir.glob("*.worker.json")), [])
+
 
 if __name__ == "__main__":
     unittest.main()

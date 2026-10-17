@@ -13,6 +13,7 @@ from typing import Any
 
 from PIL import Image
 import requests
+from src.runtime_config import read_api_key
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -37,14 +38,22 @@ def load_settings() -> APISettings:
         # Environment variables still work when python-dotenv is unavailable.
         pass
 
+    try:
+        api_key = read_api_key()
+    except ValueError:
+        raise APIClientError("Не удалось прочитать API-ключ. Проверьте настройки сервиса.") from None
     return APISettings(
         base_url=os.getenv("API_URL", DEFAULT_API_URL).rstrip("/"),
-        api_key=os.getenv("API_KEY", "").strip(),
+        api_key=api_key,
     )
 
 
 class APIClientError(RuntimeError):
     """A safe, user-displayable API error that never contains request headers."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _headers(settings: APISettings) -> dict[str, str]:
@@ -69,7 +78,7 @@ def _response_error(response: requests.Response, api_key: str = "") -> APIClient
         pass
     if not message:
         message = "Сервис вернул ошибку. Проверьте, что API запущен, и повторите попытку."
-    return APIClientError(f"Ошибка API ({response.status_code}): {message}")
+    return APIClientError(f"Ошибка API ({response.status_code}): {message}", response.status_code)
 
 
 def _json_object(response: requests.Response, api_key: str = "") -> dict[str, Any]:

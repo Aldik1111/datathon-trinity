@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+from src.runtime_config import read_api_key
 
 
 @dataclass(frozen=True)
@@ -19,7 +20,7 @@ class Settings:
     analyzer_callable: str = "src.vision.analyzer:analyze_video"
     rules_path: str | None = "configs/rules.json"
     analyzer_timeout_sec: int = 300
-    max_pending_jobs: int = 8
+    max_pending_jobs: int = 2
     job_ttl_sec: int = 24 * 60 * 60
     db_path: Path | None = None
 
@@ -43,10 +44,10 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    load_dotenv(override=False)
-    api_key = os.getenv("API_KEY")
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+    api_key = read_api_key()
     if not api_key:
-        raise ValueError("API_KEY must be set in the environment or .env file")
+        raise ValueError("API_KEY or API_KEY_FILE must be set")
     upload_dir = Path(os.getenv("UPLOAD_DIR", "artifacts/uploads")).expanduser()
     return Settings(
         api_key=api_key,
