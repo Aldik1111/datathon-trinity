@@ -1,0 +1,9 @@
+{$PUBLIC_DOMAIN} {
+    basic_auth {
+        {$JURY_USER} {$JURY_PASSWORD_HASH}
+    }
+    request_body {
+        max_size 106MB
+    }
+    reverse_proxy ui:8501
+}
