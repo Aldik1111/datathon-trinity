@@ -10,3 +10,24 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m pytest tests -q
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --target test -t trinity-test .
+      - run: docker run --rm --network none trinity-test
+      - name: Validate Compose without printing resolved secrets
+        env:
+          API_KEY: ci-synthetic-placeholder
+          PUBLIC_DOMAIN: example.invalid
+          JURY_USER: synthetic
+          JURY_PASSWORD_HASH: synthetic-placeholder
+        run: docker compose -f compose.yaml -f deploy/compose.public.yaml config --quiet
+      - name: Validate HTTPS proxy configuration offline
+        run: |
+          hash=$(docker run --rm --network none caddy:2 caddy hash-password --plaintext synthetic-ci-password)
+          docker run --rm --network none \
+            -e PUBLIC_DOMAIN=example.invalid -e JURY_USER=synthetic \
+            -e JURY_PASSWORD_HASH="$hash" \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
