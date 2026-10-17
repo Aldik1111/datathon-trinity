@@ -1,0 +1,19 @@
+{$DOMAIN} {
+    basic_auth {
+        {$JURY_USER} {$JURY_PASSWORD_HASH}
+    }
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+        -Server
+    }
+    request_body {
+        max_size 110MB
+    }
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+    handle {
+        reverse_proxy ui:8501
+    }
+}

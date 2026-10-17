@@ -6,6 +6,7 @@ import importlib
 import json
 import math
 import os
+from io import BytesIO
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from urllib.parse import urlparse
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from .contracts import AnalysisResult, Event, EvidenceFrame
 
@@ -77,6 +79,7 @@ def normalize_result(raw: Any, duration: float, rules: dict) -> dict:
     if (verdict == "violation") != bool(events) or len(events) > 100:
         raise AnalysisError("Model verdict is inconsistent with its events")
     violations = []
+    evidence_size = 0
     for raw_event in events:
         event = _mapping(raw_event)
         frames = event.get("evidence_frames")
@@ -90,6 +93,17 @@ def normalize_result(raw: Any, duration: float, rules: dict) -> dict:
                 raise AnalysisError("Evidence must contain JPEG bytes (at most 4 MiB)")
             if not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
                 raise AnalysisError("Evidence is not a JPEG image")
+            evidence_size += len(jpeg)
+            if evidence_size > 12 * 1024 * 1024:
+                raise AnalysisError('Total evidence exceeds 12 MiB')
+            try:
+                with Image.open(BytesIO(jpeg)) as image:
+                    if image.format != 'JPEG' or image.width * image.height > 16_000_000:
+                        raise AnalysisError('Evidence JPEG dimensions exceed the limit')
+            except AnalysisError:
+                raise
+            except (OSError, ValueError, Image.DecompressionBombError):
+                raise AnalysisError('Evidence JPEG cannot be decoded') from None
             decoded = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
             if decoded is None:
                 raise AnalysisError("Evidence JPEG cannot be decoded")

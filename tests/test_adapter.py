@@ -68,3 +68,14 @@ def test_corrupt_video_fails_even_in_demo(tmp_path):
     path.write_bytes(b'not a movie')
     with pytest.raises(AnalysisError):
         run_analysis(str(path), SimpleNamespace(analyzer_mode='demo'))
+
+
+def test_reject_large_decoded_jpeg_dimensions():
+    from io import BytesIO
+    from PIL import Image
+    buffer = BytesIO()
+    Image.new('RGB', (4001, 4000)).save(buffer, format='JPEG')
+    raw = AnalysisResult('violation', [Event('synthetic', 0, 'Generated image',
+                        [EvidenceFrame(0, buffer.getvalue())])])
+    with pytest.raises(AnalysisError, match='dimensions'):
+        normalize_result(raw, 1, {})

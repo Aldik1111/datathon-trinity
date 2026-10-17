@@ -109,6 +109,7 @@ class StreamlitAppTests(unittest.TestCase):
                         {"timestamp_sec": 66.0, "image_base64": jpeg},
                     ],
                     "rule": {"title": "Правило", "url": "https://example.test/rule", "section": "п. 2"},
+                    "rule_status": "verified",
                 },
             ],
         }
@@ -148,6 +149,50 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertIn("Демонстрационный режим", rendered)
         self.assertIn("Видео не удалось обработать", rendered)
         self.assertTrue(any("Демонстрационный режим" in element.value for element in at.warning))
+
+    @patch('src.ui.client.get_job')
+    @patch('src.ui.client.submit_video')
+    def test_successful_demo_does_not_claim_detection_or_verified_source(self, submit, get_job):
+        submit.return_value = {'job_id': 'demo-job', 'status': 'processing', 'demo': True}
+        get_job.return_value = {
+            'job_id': 'demo-job', 'status': 'done', 'verdict': 'violation', 'demo': True,
+            'violations': [{'type': 'synthetic', 'timecode_sec': 0, 'description': 'Искусственное событие',
+                            'evidence_frames': [], 'rule_status': 'unverified',
+                            'rule': {'title': 'DO NOT TRUST THIS SOURCE', 'url': 'https://example.test'}}],
+        }
+        with patch.dict(os.environ, {'API_KEY': 'synthetic-ui-key'}):
+            at = AppTest.from_file(self.app_path, default_timeout=10).run()
+            self._submit(at)
+        self.assertFalse(at.exception)
+        rendered = '\n'.join(str(e.value) for e in at if hasattr(e, 'value'))
+        self.assertIn('Тестовый результат интерфейса', rendered)
+        self.assertNotIn('Обнаружены признаки возможных нарушений', rendered)
+        self.assertNotIn('DO NOT TRUST THIS SOURCE', rendered)
+        self.assertIn('Нормативное основание не подтверждено', rendered)
+
+    def test_ui_upload_poll_and_jpeg_over_actual_http(self):
+        import time
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from scripts.smoke_test import running_server, synthetic_mov
+
+        with TemporaryDirectory(prefix='trinity-ui-synthetic-') as directory:
+            folder = Path(directory)
+            payload = synthetic_mov(folder/'generated.mov')
+            with running_server(folder/'server') as settings:
+                with patch.dict(os.environ, {'API_KEY': settings.api_key, 'API_URL': settings.base_url}):
+                    at = AppTest.from_file(self.app_path, default_timeout=15).run()
+                    at.file_uploader[0].set_value(('generated.mov', payload, 'video/quicktime'))
+                    next(b for b in at.button if b.label == 'Анализировать').click()
+                    at.run()
+                    deadline = time.monotonic()+25
+                    while at.session_state['job_status'] == 'processing' and time.monotonic() < deadline:
+                        time.sleep(.1)
+                        at.run()
+                    self.assertFalse(at.exception)
+                    self.assertEqual(at.session_state['job_status'], 'done')
+                    self.assertEqual(len(at.image), 1)
+                    self.assertTrue(at.session_state['job_data']['demo'])
 
 
 if __name__ == "__main__":

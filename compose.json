@@ -1,0 +1,73 @@
+{
+  "name": "trinity-service",
+  "services": {
+    "api": {
+      "build": ".",
+      "restart": "unless-stopped",
+      "init": true,
+      "environment": {
+        "API_KEY": "${API_KEY:?Generate API_KEY before starting}",
+        "UPLOAD_DIR": "/app/artifacts/uploads",
+        "API_DB_PATH": "/app/artifacts/jobs.sqlite3",
+        "MAX_UPLOAD_MB": "100",
+        "MAX_PENDING_JOBS": "2",
+        "JOB_TTL_SEC": "3600",
+        "ANALYZER_MODE": "${ANALYZER_MODE:-real}",
+        "ANALYZER_CALLABLE": "${ANALYZER_CALLABLE:-src.vision.analyzer:analyze_video}",
+        "ANALYZER_TIMEOUT_SEC": "300",
+        "RULES_PATH": "/app/configs/rules.json"
+      },
+      "volumes": ["jobs:/app/artifacts"],
+      "networks": ["backend"],
+      "read_only": true,
+      "tmpfs": ["/tmp:size=128m,mode=1777"],
+      "security_opt": ["no-new-privileges:true"],
+      "cap_drop": ["ALL"],
+      "mem_limit": "2g",
+      "cpus": 2,
+      "pids_limit": 256,
+      "stop_grace_period": "15s",
+      "healthcheck": {
+        "test": ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"],
+        "interval": "10s", "timeout": "5s", "retries": 3, "start_period": "15s"
+      },
+      "logging": {"driver": "local", "options": {"max-size": "10m", "max-file": "2"}}
+    },
+    "ui": {
+      "build": ".",
+      "command": ["python", "-m", "streamlit", "run", "src/ui/app.py", "--server.address", "0.0.0.0", "--server.port", "8501"],
+      "restart": "unless-stopped",
+      "init": true,
+      "environment": {"API_KEY": "${API_KEY:?Generate API_KEY before starting}", "API_URL": "http://api:8000"},
+      "depends_on": {"api": {"condition": "service_healthy"}},
+      "networks": ["backend"],
+      "read_only": true,
+      "tmpfs": ["/tmp:size=128m,mode=1777"],
+      "security_opt": ["no-new-privileges:true"],
+      "cap_drop": ["ALL"],
+      "mem_limit": "1g",
+      "pids_limit": 128,
+      "healthcheck": {
+        "test": ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"],
+        "interval": "10s", "timeout": "5s", "retries": 3
+      },
+      "logging": {"driver": "local", "options": {"max-size": "10m", "max-file": "2"}}
+    },
+    "proxy": {
+      "image": "caddy:2.10",
+      "restart": "unless-stopped",
+      "environment": {
+        "DOMAIN": "${DOMAIN:?Set an approved domain}",
+        "JURY_USER": "${JURY_USER:?Set jury login}",
+        "JURY_PASSWORD_HASH": "${JURY_PASSWORD_HASH:?Set a bcrypt hash}"
+      },
+      "ports": ["80:80", "443:443"],
+      "volumes": ["./deploy/Caddyfile:/etc/caddy/Caddyfile:ro", "caddy_data:/data", "caddy_config:/config"],
+      "networks": ["frontend", "backend"],
+      "depends_on": {"ui": {"condition": "service_healthy"}},
+      "logging": {"driver": "local", "options": {"max-size": "10m", "max-file": "2"}}
+    }
+  },
+  "networks": {"backend": {"internal": true}, "frontend": {}},
+  "volumes": {"jobs": {}, "caddy_data": {}, "caddy_config": {}}
+}

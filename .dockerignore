@@ -1,0 +1,14 @@
+# Only generic service source enters the image build context.
+**
+!Dockerfile
+!requirements.txt
+!src/
+!src/**
+!configs/
+!configs/**
+!scripts/
+!scripts/**
+!.streamlit/
+!.streamlit/**
+**/__pycache__
+**/*.pyc
