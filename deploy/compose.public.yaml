@@ -1,0 +1,23 @@
+# Explicit opt-in only, after approval of host, domain and access policy.
+services:
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?Set approved domain}
+      JURY_USER: ${JURY_USER:?Set jury username}
+      JURY_PASSWORD_HASH: ${JURY_PASSWORD_HASH:?Set bcrypt hash}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [service, edge]
+    depends_on:
+      ui:
+        condition: service_healthy
+networks:
+  edge:
+volumes:
+  caddy-data:
+  caddy-config:
