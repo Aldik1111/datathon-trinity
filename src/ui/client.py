@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 import os
@@ -84,18 +85,23 @@ def _json_object(response: requests.Response, api_key: str = "") -> dict[str, An
     return data
 
 
-def submit_video(settings: APISettings, filename: str, video_bytes: bytes) -> dict[str, Any]:
+def submit_video(
+    settings: APISettings, filename: str, video_bytes: bytes, roi: list[float] | None = None
+) -> dict[str, Any]:
     """Submit one .mov file and return the API's job response."""
     if Path(filename).suffix.lower() != ".mov":
         raise APIClientError("Поддерживаются видеофайлы в формате .mov.")
     if not video_bytes:
         raise APIClientError("Выбранный файл пуст.")
     try:
+        # Keep the original demo request byte-for-byte compatible when no ROI is supplied.
+        extra = {"data": {"roi": json.dumps(roi)}} if roi is not None else {}
         response = requests.post(
             f"{settings.base_url}/api/v1/analyze",
             headers=_headers(settings),
             files={"file": (Path(filename).name, video_bytes, "video/quicktime")},
             timeout=UPLOAD_TIMEOUT,
+            **extra,
         )
     except requests.Timeout as exc:
         raise APIClientError("Сервис не ответил за отведённое время. Попробуйте ещё раз.") from exc

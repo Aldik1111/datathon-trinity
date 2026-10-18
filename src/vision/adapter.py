@@ -72,10 +72,46 @@ def load_rules(path: str | None) -> dict:
 def normalize_result(raw: Any, duration: float, rules: dict) -> dict:
     result = _mapping(raw)
     verdict, events = result.get("verdict"), result.get("events")
-    if verdict not in {"violation", "no_violation"} or not isinstance(events, list):
+    scoped = result.get("analysis_scope") == "safe_state"
+    allowed = {"review_required", "no_event"} if scoped else {"violation", "no_violation"}
+    if verdict not in allowed or not isinstance(events, list):
         raise AnalysisError("Model result does not match the integration contract")
-    if (verdict == "violation") != bool(events) or len(events) > 100:
+    if (verdict in {"violation", "review_required"}) != bool(events) or len(events) > 100:
         raise AnalysisError("Model verdict is inconsistent with its events")
+    extra = {}
+    if scoped:
+        observations = result.get("observations")
+        if not isinstance(observations, list) or not 1 <= len(observations) <= 1200:
+            raise AnalysisError("Safe analysis requires sampled observations")
+        cleaned = []
+        for observation in observations:
+            if not isinstance(observation, dict) or observation.get("state") not in {"open", "closed", "unknown"}:
+                raise AnalysisError("Invalid safe state observation")
+            confidence = _confidence(observation.get("confidence"))
+            timestamp = _number(observation.get("timecode_sec"), duration)
+            if cleaned and timestamp < cleaned[-1]["timecode_sec"]:
+                raise AnalysisError("Observations must be in time order")
+            cleaned.append({"timecode_sec": timestamp, "state": observation["state"], "confidence": confidence})
+        if (verdict == "no_event") != all(item["state"] == "closed" for item in cleaned):
+            raise AnalysisError("Safe verdict is inconsistent with sampled observations")
+        summary = result.get("summary")
+        if isinstance(summary, dict):
+            counts = {state: sum(item["state"] == state for item in cleaned) for state in ("open", "closed", "unknown")}
+            if summary.get("sample_count") != len(cleaned) or summary.get("state_counts") != counts:
+                raise AnalysisError("Summary does not match sampled observations")
+            sample_fps = summary.get("sample_fps")
+            if isinstance(sample_fps, bool) or not isinstance(sample_fps, (int, float)) or not math.isfinite(sample_fps) or not 0 < sample_fps <= 30:
+                raise AnalysisError("Invalid sampling frequency")
+            if not isinstance(summary.get("events_truncated"), bool):
+                raise AnalysisError("Invalid event truncation flag")
+            if summary.get("score_semantics") != "uncalibrated_model_score":
+                raise AnalysisError("Invalid model score semantics")
+            summary = {"sample_count": len(cleaned), "state_counts": counts, "sample_fps": sample_fps,
+                       "events_truncated": summary["events_truncated"], "score_semantics": "uncalibrated_model_score"}
+        else:
+            summary = _text(summary)
+        extra = {"analysis_scope": "safe_state", "model_version": _text(result.get("model_version")),
+                 "summary": summary, "observations": cleaned}
     violations = []
     for raw_event in events:
         event = _mapping(raw_event)
@@ -108,8 +144,20 @@ def normalize_result(raw: Any, duration: float, rules: dict) -> dict:
             raise AnalysisError("Invalid rule identifier")
         violation["rule"] = rules.get(rule_id)
         violation["rule_status"] = "verified" if rule_id in rules else "unverified"
+        if scoped:
+            start = _number(event.get("start_sec"), duration)
+            end = _number(event.get("end_sec"), duration)
+            if not start <= violation["timecode_sec"] <= end:
+                raise AnalysisError("Invalid event interval")
+            violation.update(start_sec=start, end_sec=end, confidence=_confidence(event.get("confidence")))
         violations.append(violation)
-    return {"verdict": verdict, "violations": violations}
+    return {"verdict": verdict, "violations": violations, **extra}
+
+
+def _confidence(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise AnalysisError("Invalid model confidence")
+    return float(value)
 
 
 def inspect_video(path: str) -> tuple[float, bytes]:

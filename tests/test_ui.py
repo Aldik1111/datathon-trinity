@@ -71,6 +71,15 @@ class UIClientTests(unittest.TestCase):
 class StreamlitAppTests(unittest.TestCase):
     app_path = os.path.join(os.path.dirname(__file__), "..", "src", "ui", "app.py")
 
+    def setUp(self):
+        # These tests exercise the original demo flow independently of local .env configuration.
+        environment = patch.dict(os.environ, {
+            "ANALYZER_CALLABLE": "src.vision.analyzer:analyze_video",
+            "ANALYZER_MODE": "demo",
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
+
     @staticmethod
     def _jpeg_base64():
         buffer = BytesIO()

@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import json
 import logging
+import math
 import multiprocessing
 import sqlite3
 import tempfile
@@ -16,7 +17,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 from .settings import Settings, get_settings
@@ -86,6 +87,30 @@ class SafeAnalysisFailure(RuntimeError):
     """A fixed public message from the adapter that contains no raw exception data."""
 
 
+def _remove_upload(path: str | Path) -> None:
+    """Remove one job's temporary movie and its calibration sidecar together."""
+    for target in (Path(path), Path(str(path) + ".roi.json")):
+        with suppress(OSError):
+            target.unlink()
+
+
+def _parse_roi(value: str | None, required: bool) -> list[float] | None:
+    if value is None and not required:
+        return None
+    try:
+        roi = json.loads(value) if value is not None and len(value) < 256 else None
+        if not isinstance(roi, list) or len(roi) != 4:
+            raise ValueError
+        if any(isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) for n in roi):
+            raise ValueError
+        x, y, w, h = roi
+        if not (0 <= x < 1 and 0 <= y < 1 and w > 0 and h > 0 and x + w <= 1 and y + h <= 1):
+            raise ValueError
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="Select a valid safe region: [x, y, width, height] within 0..1") from None
+    return [float(n) for n in roi]
+
+
 @contextmanager
 def _connect(settings: Settings):
     connection = sqlite3.connect(settings.database_path, timeout=10)
@@ -126,8 +151,7 @@ def _initialize(settings: Settings) -> None:
             (time.time(),),
         )
     for row in interrupted:
-        with suppress(OSError):
-            Path(row["video_path"]).unlink()
+        _remove_upload(row["video_path"])
 
 
 def _cleanup_expired(settings: Settings) -> None:
@@ -138,8 +162,7 @@ def _cleanup_expired(settings: Settings) -> None:
         ).fetchall()
         db.execute("DELETE FROM jobs WHERE status!='processing' AND updated_at < ?", (cutoff,))
     for row in rows:
-        with suppress(OSError):
-            Path(row["video_path"]).unlink()
+        _remove_upload(row["video_path"])
 
 
 def _child_analyze(send_conn: Any, video_path: str, settings: Settings) -> None:
@@ -227,7 +250,7 @@ def _run_child(
 def _public_result(job_id: str, result_json: str | None, demo: int) -> dict[str, Any]:
     payload = json.loads(result_json or "{}")
     verdict = payload.get("verdict")
-    if verdict not in {"violation", "no_violation"}:
+    if verdict not in {"violation", "no_violation", "review_required", "no_event"}:
         raise RuntimeError("Analyzer returned an invalid verdict")
     raw_violations = payload.get("violations", [])
     if not isinstance(raw_violations, list):
@@ -252,6 +275,7 @@ def _public_result(job_id: str, result_json: str | None, demo: int) -> dict[str,
                 ],
                 **({"rule": item["rule"]} if "rule" in item else {}),
                 **({"rule_status": item["rule_status"]} if "rule_status" in item else {}),
+                **{key: item[key] for key in ("start_sec", "end_sec", "confidence") if key in item},
             }
         )
     response = {
@@ -262,7 +286,7 @@ def _public_result(job_id: str, result_json: str | None, demo: int) -> dict[str,
         "demo": bool(demo),
     }
     # Ruleset metadata is safe to expose and useful to clients when supplied.
-    for key in ("ruleset_version", "ruleset_hash", "model_version"):
+    for key in ("ruleset_version", "ruleset_hash", "model_version", "analysis_scope", "summary", "observations"):
         if key in payload:
             response[key] = payload[key]
     for key in ("rule", "rule_metadata", "ruleset"):
@@ -316,8 +340,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "UPDATE jobs SET status='done', result_json=?, demo=?, error=NULL, updated_at=? WHERE job_id=? AND status='processing'",
                         (encoded, int(demo), time.time(), job_id),
                     )
-                with suppress(OSError):
-                    Path(video_path).unlink()
+                _remove_upload(video_path)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -338,8 +361,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         (safe_message, time.time(), job_id),
                     )
                 if row:
-                    with suppress(OSError):
-                        Path(row["video_path"]).unlink()
+                    _remove_upload(row["video_path"])
             finally:
                 queue.task_done()
 
@@ -378,8 +400,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 (time.time(),),
             )
         for row in paths:
-            with suppress(OSError):
-                Path(row["video_path"]).unlink()
+            _remove_upload(row["video_path"])
 
     app = FastAPI(title="Trinity Video Analysis API", version="1.0.0", lifespan=lifespan)
     app.state.settings = configured
@@ -397,9 +418,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/v1/analyze", status_code=202)
     async def analyze_video(
-        file: UploadFile = File(...), x_api_key: str | None = Header(default=None)
+        file: UploadFile = File(...), x_api_key: str | None = Header(default=None),
+        roi: str | None = Form(default=None),
     ) -> JSONResponse:
         require_key(x_api_key)
+        selected_roi = _parse_roi(roi, configured.analyzer_mode == "real" and configured.analyzer_callable == "src.vision.safe_classifier:analyze_video")
         _cleanup_expired(configured)
         if not file.filename or Path(file.filename).suffix.lower() != ".mov":
             raise HTTPException(status_code=415, detail="Only .mov files are accepted")
@@ -429,9 +452,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     output.write(chunk)
             if size == 0:
                 raise HTTPException(status_code=400, detail="Uploaded file is empty")
+            if selected_roi is not None:
+                Path(str(target) + ".roi.json").write_text(json.dumps({"roi": selected_roi}), encoding="utf-8")
         except BaseException:
-            with suppress(OSError):
-                target.unlink()
+            _remove_upload(target)
             async with lock:
                 state["reservations"] -= 1
                 reserved = False
@@ -462,8 +486,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 state["reservations"] -= 1
                 reserved = False
         except BaseException:
-            with suppress(OSError):
-                target.unlink()
+            _remove_upload(target)
             raise
         finally:
             if reserved:
