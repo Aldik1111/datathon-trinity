@@ -133,6 +133,21 @@ def get_job(settings: APISettings, job_id: str) -> dict[str, Any]:
     return _json_object(response, settings.api_key)
 
 
+def get_readiness(settings: APISettings) -> dict[str, Any]:
+    """Fetch the API's configured routing and contract readiness summary."""
+    try:
+        response = requests.get(
+            f"{settings.base_url}/api/v1/readiness",
+            headers=_headers(settings),
+            timeout=POLL_TIMEOUT,
+        )
+    except requests.Timeout as exc:
+        raise APIClientError("Истекло время ожидания ответа API.") from exc
+    except requests.RequestException as exc:
+        raise APIClientError("Не удалось получить готовность API. Проверьте, что локальный API запущен.") from exc
+    return _json_object(response, settings.api_key)
+
+
 def decode_evidence_image(value: object) -> bytes | None:
     """Decode and validate a base64 JPEG evidence frame; malformed frames are skipped."""
     if not isinstance(value, str) or not value:

@@ -34,7 +34,8 @@ def test_invalid_temporal_inputs_fail_instead_of_publishing_partial_result(times
         temporal_features(np.asarray(times), np.asarray(vectors))
 
 
-def test_renaming_video_does_not_change_extracted_features(tmp_path):
+@pytest.mark.parametrize('feature_version', ['mobilenetv2-gap-temporal-v1', 'mobilenetv2-gap-temporal-residual-v2'])
+def test_renaming_video_does_not_change_extracted_features(tmp_path, feature_version):
     import cv2
     from src.vision.scenario_features import extract_video_features
     first = tmp_path / 'X-1.mov'
@@ -49,9 +50,30 @@ def test_renaming_video_does_not_change_extracted_features(tmp_path):
         def encode(self, frame):
             return np.full(256, frame.mean() / 255, dtype=np.float32)
 
-    ta, xa = extract_video_features(first, None, encoder=PixelEncoder())
-    tb, xb = extract_video_features(renamed, None, encoder=PixelEncoder())
+    ta, xa = extract_video_features(first, None, encoder=PixelEncoder(), feature_version=feature_version)
+    tb, xb = extract_video_features(renamed, None, encoder=PixelEncoder(), feature_version=feature_version)
     assert np.allclose(ta, [0, 1, 2])
     assert xa.shape == (3, 768)
     assert np.array_equal(ta, tb)
     assert np.array_equal(xa, xb)
+
+
+def test_residual_features_remove_constant_scene_without_losing_temporal_change():
+    from src.vision.scenario_features import temporal_features, scene_residual_features
+    times = np.arange(7.)
+    movement = np.zeros((7, 256), dtype=np.float32)
+    movement[3:5, :10] = 2.
+    first = temporal_features(times, movement)
+    shifted = temporal_features(times, movement + 30.)
+    original = shifted.copy()
+    np.testing.assert_allclose(scene_residual_features(first), scene_residual_features(shifted), atol=2e-6)
+    np.testing.assert_array_equal(shifted, original)
+    result = scene_residual_features(shifted)
+    assert np.any(result[:, 512:] != 0)
+    assert result[3, 0] == 2. and result[0, 0] == 0.
+
+
+def test_static_clip_has_no_residual_action_evidence():
+    from src.vision.scenario_features import temporal_features, scene_residual_features
+    features = temporal_features(np.arange(8.), np.full((8, 256), 7., dtype=np.float32))
+    assert not scene_residual_features(features).any()

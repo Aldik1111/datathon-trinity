@@ -88,7 +88,7 @@ def test_class_weights_balance_groups_and_classes_not_clip_length(tmp_path):
     assert samples['positive_groups'] == 2 and samples['negative_groups'] == 2
 
 
-def test_excluded_group_changes_neither_scaling_nor_heads_and_singleton_abstains(tmp_path):
+def test_excluded_group_changes_neither_scaling_nor_heads_and_rare_class_abstains(tmp_path):
     data_api, training = modules()
     path, cache = fixture(tmp_path)
     data = data_api.load_dataset(path, cache)
@@ -98,7 +98,7 @@ def test_excluded_group_changes_neither_scaling_nor_heads_and_singleton_abstains
     second = training.fit_heads(data, excluded_groups={heldout['group_id']})
     for name in ('coef', 'intercept', 'mean', 'scale', 'supported'):
         np.testing.assert_array_equal(first[name], second[name])
-    assert first['supported'].tolist() == [True, False]
+    assert first['supported'].tolist() == [False, False]
     assert not first['coef'][1].any() and first['intercept'][1] == 0
     results = training.score_group(first, heldout)
     assert results[1]['score'] is None and results[1]['peak_sec'] is None
@@ -122,9 +122,13 @@ def test_comparison_preserves_duplicates_and_unsupported_denominators(tmp_path):
     assert all(r['in_sample']['evaluation'] == 'resubstitution' for r in comparison['rows'])
     single = report['out_of_fold']['per_type']['safe_key_left']
     assert single['known_truth'] == 3 and single['unknown_truth'] == 2
-    assert single['unsupported'] == 1 and single['scored'] == 2
+    assert single['unsupported'] == 3 and single['scored'] == 0
     assert single['scored_positive'] == 0 and single['recall'] is None
-    assert report['in_sample']['per_type']['safe_key_left']['unsupported'] == 0
+    # A single independently positive media group cannot produce a live head,
+    # even in the final all-data fit; its score remains an explicit abstention.
+    assert report['in_sample']['per_type']['safe_key_left']['unsupported'] == 3
+    with np.load(output / 'model.npz', allow_pickle=False) as artifact:
+        assert artifact['supported'].tolist() == [True, False]
     with np.load(output / 'model.npz', allow_pickle=False) as artifact:
         assert artifact['coef'].shape == (2, 768)
         assert artifact['supported'].dtype.kind == 'b'
@@ -132,6 +136,12 @@ def test_comparison_preserves_duplicates_and_unsupported_denominators(tmp_path):
     metadata = json.loads((output / 'metadata.json').read_text('utf-8'))
     assert metadata['artifact_sha256'] == hashlib.sha256((output / 'model.npz').read_bytes()).hexdigest()
     assert metadata['threshold'] == .65 and metadata['training_scope'] == 'all_available_weak_labels'
+    assert metadata['schema_version'] == 2
+    assert metadata['support_policy'] == dict(min_positive_media_groups=2, min_negative_media_groups=1,
+                                              unsupported_decision='abstain; score is null')
+    assert metadata['model_version'].startswith('scenario-cpu-v2-')
+    assert metadata['classes'][1]['positive_groups'] == 1
+    assert metadata['limitations']
 
 
 def test_known_truth_metrics_do_not_turn_abstention_or_unknown_into_negative():
@@ -149,7 +159,35 @@ def test_known_truth_metrics_do_not_turn_abstention_or_unknown_into_negative():
     assert metrics['anchor_hits'] == 1 and metrics['anchor_evaluated'] == 1
 
 
-def test_overall_binary_requires_support_for_every_expected_type_or_normal_class():
+def test_training_does_not_overwrite_an_existing_model_version(tmp_path):
+    _, training = modules()
+    path, cache = fixture(tmp_path)
+    output = tmp_path / 'saved-version'
+    output.mkdir()
+    artifact = output / 'model.npz'
+    artifact.write_bytes(b'preserve existing model')
+    with pytest.raises(ValueError, match='already exists'):
+        training.train(path, cache, output)
+    assert artifact.read_bytes() == b'preserve existing model'
+
+
+def test_cache_fingerprint_prevents_training_under_different_labels(tmp_path):
+    dataset, _ = modules()
+    path, cache = fixture(tmp_path)
+    metadata = json.loads((cache / 'metadata.json').read_text())
+    metadata['manifest_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (cache / 'metadata.json').write_text(json.dumps(metadata))
+    dataset.load_dataset(path, cache)
+    # Even a provenance change requires an explicit cache association; do not
+    # silently report the old fingerprint with the new training labels.
+    manifest = json.loads(path.read_text())
+    manifest['rows'][0]['annotation_status'] = 'corrected'
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match='fingerprint'):
+        dataset.load_dataset(path, cache)
+
+
+def test_overall_metrics_report_supported_normal_alarm_and_expected_cause_match():
     _, training = modules()
     assert hasattr(training, 'overall_binary_metrics'), 'Missing coverage-aware binary evaluation'
     def row(positive, expected, decisions):
@@ -164,6 +202,14 @@ def test_overall_binary_requires_support_for_every_expected_type_or_normal_class
     assert {k: metrics[k] for k in ('tp', 'fp', 'tn', 'fn', 'scored', 'unsupported')} == {
         'tp': 1, 'fp': 1, 'tn': 0, 'fn': 1, 'scored': 3, 'unsupported': 2}
     assert metrics['coverage'] == .6 and metrics['recall'] == .5
+    # The second normal row has one supported alarm and one unsupported head.
+    # It is omitted from conditional binary accuracy but remains an observed alarm.
+    assert metrics['normal_alarm_rows'] == 2
+    assert metrics['normal_rows'] == 2
+    assert metrics['normal_alarm_rate'] == 1.
+    assert metrics['positive_expected_type_match_rows'] == 0
+    assert metrics['positive_expected_type_evaluable_rows'] == 2
+    assert metrics['positive_expected_type_match_rate'] == 0.
 
 
 @pytest.mark.parametrize('fault', ['nan', 'version', 'group_membership', 'missing_anchor'])

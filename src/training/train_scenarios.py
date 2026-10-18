@@ -17,6 +17,10 @@ from src.training.scenario_dataset import FEATURE_DIM, load_dataset, label_mask
 REGULARIZATION = .01
 THRESHOLD = .65
 ANCHOR_TOLERANCE_SEC = 5.
+# A single positive media group is too little independent evidence to expose a
+# class head. This fixed policy also keeps the final model consistent with the
+# leave-one-group-out folds, where a singleton class is always unsupported.
+MIN_POSITIVE_GROUPS = 2
 LIMITATIONS = [
     'Экспериментальные кандидаты по исходной таблице; спорные метки не становятся подтверждёнными событиями.',
     'Оценки модели не калиброваны и не являются вероятностью доказанного нарушения.',
@@ -26,6 +30,7 @@ LIMITATIONS = [
     'Точность времени измеряется относительно слабой отметки таблицы с допуском ±5 секунд, а не границ события.',
     'Повторный прогон всех обучающих видео является оценкой на обучающем наборе, отдельно от отложенной проверки.',
     'Строки с разными причинами на одном исходном видео сохраняются в сравнении; обучение использует объединение причин.',
+    'Голова класса не публикуется при поддержке менее чем двумя независимыми положительными группами или без отрицательной группы.',
 ]
 
 
@@ -82,7 +87,8 @@ def fit_heads(dataset, excluded_groups=()):
         samples = class_samples(dataset, definition['type'], excluded)
         support = dict(positive_groups=samples['positive_groups'], negative_groups=samples['negative_groups'])
         definitions.append(dict(definition, **support))
-        if min(support.values()) == 0:
+        if (support['positive_groups'] < MIN_POSITIVE_GROUPS
+                or support['negative_groups'] == 0):
             continue
         model = LogisticRegression(C=REGULARIZATION, solver='liblinear', random_state=0,
                                    max_iter=2000, tol=1e-8)
@@ -141,19 +147,46 @@ def overall_binary_metrics(rows, scope):
     """Any-candidate screening, with unsupported expected causes excluded.
 
 This deliberately does not measure cause correctness; per-type metrics do.
-Normal rows need all heads supported, since any head could produce a candidate.
+The conditional binary metrics retain complete-head eligibility for normal rows.
+Separate alarm counts expose every normal row with at least one supported head.
 """
     entries = []
+    normal_rows = normal_alarm_rows = 0
+    positive_evaluable_rows = positive_expected_type_match_rows = 0
     for row in rows:
         results = row[scope]['class_results']
         by_type = {entry['type']: entry for entry in results}
-        needed = row['expected_types'] if row['table_violation'] else list(by_type)
-        supported = bool(needed) and all(t in by_type and by_type[t]['decision'] != 'unsupported' for t in needed)
-        decision = ('candidate' if any(e['decision'] == 'candidate' for e in results) else 'not_flagged') if supported else 'unsupported'
+        supported_results = [e for e in results if e['decision'] != 'unsupported']
+        has_candidate = any(e['decision'] == 'candidate' for e in supported_results)
+        if row['table_violation']:
+            expected = row['expected_types']
+            expected_supported = bool(expected) and all(
+                t in by_type and by_type[t]['decision'] != 'unsupported' for t in expected)
+            if expected_supported:
+                positive_evaluable_rows += 1
+                if any(by_type[t]['decision'] == 'candidate' for t in expected):
+                    positive_expected_type_match_rows += 1
+            supported = expected_supported
+        else:
+            # A supported head can still reveal a false alarm even when some
+            # other class is unsupported. Rows with no supported heads abstain.
+            supported = bool(results) and len(supported_results) == len(results)
+            if supported_results:
+                normal_rows += 1
+                normal_alarm_rows += int(has_candidate)
+        decision = ('candidate' if has_candidate else 'not_flagged') if supported else 'unsupported'
         entries.append(dict(truth=row['table_violation'], decision=decision))
     metrics = binary_metrics(entries)
+    metrics.update(normal_alarm_rows=normal_alarm_rows, normal_rows=normal_rows,
+                   normal_unobservable_rows=sum(not r['table_violation'] for r in rows) - normal_rows,
+                   normal_alarm_rate=normal_alarm_rows / normal_rows if normal_rows else None,
+                   positive_expected_type_match_rows=positive_expected_type_match_rows,
+                   positive_expected_type_evaluable_rows=positive_evaluable_rows,
+                   positive_expected_type_match_rate=(positive_expected_type_match_rows / positive_evaluable_rows
+                       if positive_evaluable_rows else None))
     metrics['interpretation'] = 'Any candidate versus table-positive clip; cause correctness is evaluated separately.'
-    metrics['eligibility'] = 'Positive rows: every expected type supported; normal rows: every model class supported.'
+    metrics['eligibility'] = ('Conditional binary: positive rows need every expected type supported; normal rows need every class supported. '
+                              'Normal alarm rate uses rows with at least one supported head; expected-type match rate checks listed causes.')
     return metrics
 
 
@@ -182,6 +215,8 @@ def _write_json(path, value):
 def train(manifest_path, feature_cache, output_dir):
     dataset = load_dataset(manifest_path, feature_cache)
     output = Path(output_dir)
+    if any((output / name).exists() for name in ('model.npz', 'metadata.json', 'report.json')):
+        raise ValueError('Model output already exists; choose a new version directory')
     output.mkdir(parents=True, exist_ok=True)
     heldout = {}
     for fold_index, group in enumerate(dataset['groups'], start=1):
@@ -202,9 +237,14 @@ def train(manifest_path, feature_cache, output_dir):
     version_hash.update(json.dumps(dict(feature_version=dataset['feature_version'],
                                        backbone_sha256=dataset['backbone_sha256'], classes=model['classes'],
                                        threshold=THRESHOLD), sort_keys=True).encode())
-    version = 'scenario-cpu-v1-' + version_hash.hexdigest()[:16]
+    support_policy = dict(min_positive_media_groups=MIN_POSITIVE_GROUPS,
+                          min_negative_media_groups=1,
+                          unsupported_decision='abstain; score is null')
+    version_hash.update(json.dumps(dict(schema_version=2, support_policy=support_policy), sort_keys=True).encode())
+    version = 'scenario-cpu-v2-' + version_hash.hexdigest()[:16]
     np.savez(output / 'model.npz', **{k: model[k] for k in ('coef', 'intercept', 'mean', 'scale', 'supported')})
-    metadata = dict(schema_version=1, feature_version=dataset['feature_version'], model_version=version,
+    metadata = dict(schema_version=2, support_policy=support_policy,
+                    feature_version=dataset['feature_version'], model_version=version,
                     threshold=THRESHOLD, selected_C=REGULARIZATION, classes=model['classes'],
                     artifact_sha256=hashlib.sha256((output / 'model.npz').read_bytes()).hexdigest(),
                     backbone_sha256=dataset['backbone_sha256'], training_scope='all_available_weak_labels',
@@ -230,7 +270,7 @@ def train(manifest_path, feature_cache, output_dir):
                    duplicate_conflict_rows=sum(r['duplicate_conflict'] for r in rows),
                    positive_groups=sum(g['positive'] for g in groups.values()),
                    negative_groups=sum(not g['positive'] for g in groups.values()))
-    report = dict(schema_version=1, model_version=version, feature_version=dataset['feature_version'],
+    report = dict(schema_version=2, model_version=version, feature_version=dataset['feature_version'],
                   threshold=THRESHOLD, selected_C=REGULARIZATION, classes=model['classes'],
                   score_semantics='uncalibrated_model_score', summary=summary, limitations=LIMITATIONS,
                   manifest_sha256=dataset['manifest_sha256'], cache_metadata_sha256=dataset['cache_metadata_sha256'],
@@ -238,6 +278,7 @@ def train(manifest_path, feature_cache, output_dir):
                       class_truth='listed type positive; explicit normal clip negative; remaining labels unknown',
                       weights='equal group mass within each class and equal mass between classes; total weight equals labelled groups',
                       scaling='training groups only, equal group moments on labelled windows',
+                      support_policy=support_policy,
                       positive_anchor_radius_sec=3., anchor_tolerance_sec=ANCHOR_TOLERANCE_SEC,
                       hyperparameter_tuning=False, metric_unit='source_table_row; duplicate-safe unique_group metrics also provided'))
     for scope, predictions in [('out_of_fold', heldout), ('in_sample', in_sample)]:
@@ -252,7 +293,7 @@ def train(manifest_path, feature_cache, output_dir):
             group['anchors'], scope)['class_results']]
         stats['unique_group'] = _aggregate(unique_entries, model['classes'])
         report[scope] = stats
-    comparison = dict(schema_version=1, model_version=version, feature_version=dataset['feature_version'],
+    comparison = dict(schema_version=2, model_version=version, feature_version=dataset['feature_version'],
                       threshold=THRESHOLD, score_semantics='uncalibrated_model_score', classes=model['classes'],
                       summary=summary, limitations=LIMITATIONS, rows=rows,
                       out_of_fold=report['out_of_fold'], in_sample=report['in_sample'])

@@ -10,7 +10,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .scenario_features import BACKBONE_SHA256, FEATURE_DIM, FEATURE_VERSION, SAMPLE_FPS, extract_video_features
+from .scenario_features import (BACKBONE_SHA256, FEATURE_DIM, FEATURE_VERSION, SAMPLE_FPS,
+                                SUPPORTED_FEATURE_VERSIONS, extract_video_features)
 from .video_io import iter_sampled_frames
 
 
@@ -31,9 +32,21 @@ def load_model(directory) -> ScenarioModel:
         artifact = (directory / 'model.npz').read_bytes()
         if metadata.get('artifact_sha256') != hashlib.sha256(artifact).hexdigest():
             raise ValueError('Head checksum mismatch')
-        if (metadata.get('schema_version') != 1 or metadata.get('feature_version') != FEATURE_VERSION
+        schema = metadata.get('schema_version')
+        if (schema not in (1, 2) or isinstance(schema, bool)
+                or metadata.get('feature_version') not in SUPPORTED_FEATURE_VERSIONS
                 or metadata.get('backbone_sha256') != BACKBONE_SHA256):
             raise ValueError('Unsupported feature pipeline')
+        if schema == 1:
+            if metadata['feature_version'] != FEATURE_VERSION:
+                raise ValueError('Legacy model requires legacy features')
+            min_positive, min_negative = 1, 1
+        else:
+            policy = metadata.get('support_policy', {})
+            min_positive = policy.get('min_positive_media_groups')
+            min_negative = policy.get('min_negative_media_groups')
+            if type(min_positive) is not int or min_positive != 2 or type(min_negative) is not int or min_negative != 1:
+                raise ValueError('Unsupported class support policy')
         classes = metadata['classes']
         if not isinstance(classes, list) or not 1 <= len(classes) <= 50:
             raise ValueError('Invalid scenario class list')
@@ -69,7 +82,7 @@ def load_model(directory) -> ScenarioModel:
                 raise ValueError('Invalid numeric weights')
         if np.any(arrays['scale'] <= 0):
             raise ValueError('Invalid scale')
-        expected = np.array([row['positive_groups'] > 0 and row['negative_groups'] > 0 for row in classes])
+        expected = np.array([row['positive_groups'] >= min_positive and row['negative_groups'] >= min_negative for row in classes])
         if not np.array_equal(arrays['supported'], expected):
             raise ValueError('Class support and availability disagree')
         return ScenarioModel(metadata=metadata, **arrays)
@@ -112,7 +125,8 @@ def analyze_video(video_path: str) -> dict:
     directory = Path(os.environ.get('MODEL_PATH') or os.environ.get('SCENARIO_MODEL_PATH') or '')
     model = load_model(directory)
     cv2.setNumThreads(4)
-    timestamps, vectors = extract_video_features(video_path, directory / 'backbone.onnx')
+    kwargs = {} if model.metadata['feature_version'] == FEATURE_VERSION else dict(feature_version=model.metadata['feature_version'])
+    timestamps, vectors = extract_video_features(video_path, directory / 'backbone.onnx', **kwargs)
     classes, scores = score_features(model, timestamps, vectors)
     events, needed = [], set()
     for index, result in enumerate(classes):
@@ -142,7 +156,9 @@ def analyze_video(video_path: str) -> dict:
     for event in events:
         event['evidence_frames'] = [evidence[t] for t in event.pop('_points')]
     return dict(analysis_scope='bank_scenarios', verdict='review_required' if events else 'no_candidate',
-                model_version=model.metadata['model_version'], feature_version=FEATURE_VERSION,
+                model_version=model.metadata['model_version'], feature_version=model.metadata['feature_version'],
+                model_support_policy={key: model.metadata.get('support_policy', {}).get(key, 1)
+                                      for key in ('min_positive_media_groups', 'min_negative_media_groups')},
                 score_semantics='uncalibrated_model_score',
                 summary=dict(sample_count=len(timestamps), sample_fps=SAMPLE_FPS, events_truncated=False),
                 class_results=classes, events=events, limitations=[

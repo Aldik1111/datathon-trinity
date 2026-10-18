@@ -49,6 +49,39 @@ def test_tampered_numeric_artifact_is_rejected(tmp_path):
         load_model(path)
 
 
+def test_v2_support_policy_abstains_on_singleton_while_legacy_remains_loadable(tmp_path):
+    from src.vision.scenario_classifier import load_model, score_features
+    from src.vision.scenario_features import RESIDUAL_FEATURE_VERSION
+    path = make_model(tmp_path)
+    metadata_path = path / 'metadata.json'
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(schema_version=2, feature_version=RESIDUAL_FEATURE_VERSION,
+                    support_policy=dict(min_positive_media_groups=2, min_negative_media_groups=1))
+    metadata['classes'][1]['positive_groups'] = 1
+    metadata_path.write_text(json.dumps(metadata))
+    model = load_model(path)
+    scores, _ = score_features(model, np.arange(2.), np.zeros((2, 768)))
+    assert scores[1]['decision'] == 'unsupported' and scores[1]['score'] is None
+    metadata['support_policy']['min_positive_media_groups'] = True
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError):
+        load_model(path)
+
+
+def test_v2_singleton_abstention_survives_service_normalization():
+    from tests.test_scenario_api import scenario_result
+    from src.vision.adapter import normalize_result, AnalysisError
+    raw = scenario_result(False)
+    raw['model_support_policy'] = dict(min_positive_media_groups=2, min_negative_media_groups=1)
+    raw['class_results'][1]['positive_groups'] = 1
+    normalized = normalize_result(raw, 2., {})
+    assert normalized['class_results'][1]['decision'] == 'unsupported'
+    assert normalized['model_support_policy']['min_positive_media_groups'] == 2
+    raw['model_support_policy']['min_positive_media_groups'] = True
+    with pytest.raises(AnalysisError):
+        normalize_result(raw, 2., {})
+
+
 def test_inference_is_pixel_based_and_outputs_candidate_window_evidence(tmp_path, monkeypatch):
     import cv2
     from src.vision import scenario_classifier as module

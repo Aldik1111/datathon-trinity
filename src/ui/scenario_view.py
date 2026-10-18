@@ -46,7 +46,7 @@ def local_examples() -> list[dict[str, str]]:
 
 
 def upload(accept_job: Callable[[dict[str, Any]], None]) -> None:
-    st.warning("Эксперимент: слабые метки таблицы и всего 1–4 независимых положительных примера на тип. Модель предлагает кандидатов; причина действия и нарушение требуют проверки человеком.")
+    st.warning("Эксперимент со слабыми метками. Поддержка типов зависит от числа независимых примеров и показана в результате. Модель предлагает кандидатов; причина действия и нарушение требуют проверки человеком.")
     quality_notice()
     examples = local_examples()
     options = ["Локальные примеры", "Загрузить MOV"] if examples else ["Загрузить MOV", "Локальные примеры"]
@@ -89,18 +89,20 @@ def quality_notice() -> None:
         return
     try:
         report = json.loads(Path(path).read_text(encoding="utf-8"))
-        independent = report["out_of_fold"]
-        micro, binary = independent["micro"], independent["overall_binary"]
+        grouped = report["out_of_fold"]
+        micro, binary = grouped["micro"], grouped["overall_binary"]
         values = [micro["tp"], micro["scored_positive"], micro["unsupported"],
-                  binary["fp"], binary["scored_negative"]]
+                  binary.get("normal_alarm_rows", binary["fp"]),
+                  binary.get("normal_rows", binary["scored_negative"])]
         if any(type(value) is not int or value < 0 for value in values):
             return
     except (OSError, ValueError, KeyError, TypeError):
         return
     tp, positives, unsupported, false_alarms, normals = values
-    st.error(f"Независимая проверка: найдено {tp} из {positives} оцениваемых положительных меток; "
+    st.error(f"Групповая проверка на известном наборе: найдено {tp} из {positives} оцениваемых положительных меток; "
              f"ложные тревоги на {false_alarms} из {normals} нормальных видео. "
              f"Без поддержки: {unsupported} меток. Результаты требуют ручной проверки.")
+    st.caption("OOF исключает целую группу дублей из обучения. Это не проверка на новых независимых съёмках; неподдерживаемые типы не считаются отсутствующими.")
 
 
 def _class_table(classes: Any) -> list[dict[str, Any]]:
@@ -109,8 +111,8 @@ def _class_table(classes: Any) -> list[dict[str, Any]]:
     return [{"Тип": item.get("title", item.get("type")), "Оценка модели": item.get("score"),
              "Порог": item.get("threshold"), "Решение": DECISIONS.get(item.get("decision"), "Неизвестно"),
              "Положительных групп": item.get("positive_groups"), "Отрицательных групп": item.get("negative_groups"),
-             "Поддержка": "1 пример · редкий тип" if item.get("positive_groups") == 1 else
-                          ("Нет поддержки" if item.get("decision") == "unsupported" else "Несколько примеров"),
+             "Поддержка": "Нет поддержки" if item.get("decision") == "unsupported" else
+                          ("1 пример · редкий тип" if item.get("positive_groups") == 1 else "Несколько примеров"),
              "Пик": client.format_timecode(item.get("peak_sec")) if item.get("peak_sec") is not None else "—"}
             for item in classes if isinstance(item, dict)]
 
@@ -134,6 +136,7 @@ def render_result(job: dict[str, Any]) -> None:
     st.dataframe(_class_table(classes), hide_index=True, width="stretch")
     st.caption("Оценка модели — не калиброванная вероятность. «Ниже порога» не означает, что действие отсутствует; «Нет поддержки» означает, что модель не может оценить этот тип.")
     st.info("Результат не подтверждает причину действия: личность клиента, содержание отчёта, сетевое соединение, принадлежность денег и работу замка нельзя установить только по похожим кадрам.")
+    st.caption("Нормативная квалификация кандидатов не подтверждена: видимое действие и нарушение регламента проверяются отдельно.")
     events = job.get("violations", [])
     for event in events if isinstance(events, list) else []:
         if not isinstance(event, dict):

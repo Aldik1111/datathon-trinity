@@ -175,6 +175,14 @@ def _scenario_metadata(result: dict, events: list, duration: float) -> dict:
     """Validate partial-support candidate scores without asserting a violation."""
     if result.get("score_semantics") != "uncalibrated_model_score":
         raise AnalysisError("Invalid model score semantics")
+    policy = result.get("model_support_policy", {"min_positive_media_groups": 1, "min_negative_media_groups": 1})
+    if (not isinstance(policy, dict)
+            or set(policy) != {"min_positive_media_groups", "min_negative_media_groups"}
+            or type(policy.get("min_positive_media_groups")) is not int
+            or policy["min_positive_media_groups"] not in (1, 2)
+            or type(policy.get("min_negative_media_groups")) is not int
+            or policy["min_negative_media_groups"] != 1):
+        raise AnalysisError("Invalid scenario support policy")
     classes = result.get("class_results")
     if not isinstance(classes, list) or not 1 <= len(classes) <= 50:
         raise AnalysisError("Scenario analysis requires class results")
@@ -192,7 +200,7 @@ def _scenario_metadata(result: dict, events: list, duration: float) -> dict:
         decision = row.get("decision")
         if not isinstance(decision, str) or decision not in {"candidate", "not_flagged", "unsupported"}:
             raise AnalysisError("Invalid scenario decision")
-        supported = positive > 0 and negative > 0
+        supported = positive >= policy["min_positive_media_groups"] and negative >= policy["min_negative_media_groups"]
         if (decision != "unsupported") != supported:
             raise AnalysisError("Scenario decision contradicts model support")
         score, peak = row.get("score"), row.get("peak_sec")
@@ -225,6 +233,7 @@ def _scenario_metadata(result: dict, events: list, duration: float) -> dict:
     return {"analysis_scope": "bank_scenarios", "model_version": _text(result.get("model_version")),
             "feature_version": _text(result.get("feature_version")),
             "score_semantics": "uncalibrated_model_score", "class_results": cleaned,
+            "model_support_policy": dict(policy),
             "limitations": [_text(value) for value in limitations],
             "summary": {"sample_count": summary["sample_count"], "sample_fps": float(sample_fps),
                         "events_truncated": summary["events_truncated"]}}

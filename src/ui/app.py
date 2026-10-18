@@ -22,6 +22,7 @@ from src.ui.client import (
     decode_evidence_image,
     format_timecode,
     get_job,
+    get_readiness,
     load_settings,
     submit_video,
 )
@@ -408,9 +409,24 @@ def main() -> None:
     st.info(
         "Результаты требуют проверки человеком. Интерфейс помогает найти фрагменты видео и не выносит окончательное решение."
     )
+    try:
+        readiness = get_readiness(load_settings())
+        jury_compatibility = readiness.get("jury_contract_compatible")
+        jury_label = "да" if jury_compatibility is True else "нет" if jury_compatibility is False else "неизвестна"
+        st.caption(
+            f"Режим по умолчанию API: {readiness.get('default_analysis_type')}; "
+            f"запрос без analysis_type: {readiness.get('omitted_analysis_type_routes_to')}; "
+            f"маршрут для jury: {'да' if readiness.get('configured_for_jury_contract') else 'нет'}; "
+            f"совместимость jury: {jury_label}."
+        )
+        if jury_compatibility is not True:
+            st.warning(str(readiness.get("jury_contract_basis", "Jury-совместимость не подтверждена.")))
+    except APIClientError as exc:
+        st.caption(f"Не удалось прочитать готовность API: {exc}")
 
-    safe_mode = os.getenv("ANALYZER_CALLABLE") == "src.vision.safe_classifier:analyze_video"
-    scenario_available = bool(os.getenv("SCENARIO_MODEL_PATH", "").strip())
+    real_mode = os.getenv("ANALYZER_MODE", "real").lower() == "real"
+    safe_mode = real_mode and os.getenv("ANALYZER_CALLABLE") == "src.vision.safe_classifier:analyze_video"
+    scenario_available = real_mode and bool(os.getenv("SCENARIO_MODEL_PATH", "").strip())
     if scenario_available:
         mode = st.radio("Режим анализа", list(scenario_view.MODE_TITLES), format_func=scenario_view.MODE_TITLES.get,
                         horizontal=True, key="analysis_mode")
@@ -421,7 +437,7 @@ def main() -> None:
         scenario_view.upload(_accept_job)
         scenario_view.comparison_report()
     elif mode == "safe_state":
-        _safe_upload(analysis_type="safe_state" if scenario_available else None)
+        _safe_upload(analysis_type="safe_state")
         _show_model_report()
     else:
         with st.form("video_upload", clear_on_submit=False):

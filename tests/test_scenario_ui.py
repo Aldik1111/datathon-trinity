@@ -32,6 +32,14 @@ def rendered(at):
     return "\n".join(str(element.value) for element in at if hasattr(element, "value"))
 
 
+def test_demo_does_not_offer_real_analyzers_when_weight_paths_are_configured():
+    with patch.dict(os.environ, {**SCENARIO_ENV, "ANALYZER_MODE": "demo"}):
+        at = AppTest.from_file(str(APP), default_timeout=10).run()
+    assert not at.exception
+    assert not at.radio and not at.number_input
+    assert len(at.file_uploader) == 1
+
+
 def test_quality_notice_uses_independent_metrics_before_manual_upload(tmp_path):
     report = tmp_path / "quality.json"
     report.write_text(json.dumps({"rows": [], "out_of_fold": {
@@ -44,6 +52,20 @@ def test_quality_notice_uses_independent_metrics_before_manual_upload(tmp_path):
     assert "4 из 18" in notices
     assert "19 из 20" in notices
     assert "11" in notices
+
+
+def test_quality_notice_keeps_normal_alarms_visible_when_other_heads_abstain(tmp_path):
+    report = tmp_path / "quality.json"
+    report.write_text(json.dumps({"rows": [], "out_of_fold": {
+        "micro": {"tp": 3, "scored_positive": 10, "unsupported": 239},
+        "overall_binary": {"fp": 0, "scored_negative": 0,
+                           "normal_alarm_rows": 16, "normal_rows": 20}}}), encoding="utf-8")
+    with patch.dict(os.environ, {**SCENARIO_ENV, "SCENARIO_COMPARISON_REPORT": str(report)}):
+        at = AppTest.from_file(str(APP), default_timeout=10).run()
+    assert not at.exception
+    notices = "\n".join(str(item.value) for item in at.error)
+    assert "16 из 20" in notices and "0 из 0" not in notices
+    assert "Групповая проверка" in notices
 
 
 def manifest_42(tmp_path):

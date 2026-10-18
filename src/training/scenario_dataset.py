@@ -13,6 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+from src.vision.scenario_features import SUPPORTED_FEATURE_VERSIONS
 
 FEATURE_VERSION = 'mobilenetv2-gap-temporal-v1'
 FEATURE_DIM = 768
@@ -53,8 +54,11 @@ def load_dataset(manifest_path, feature_cache):
     path, cache = Path(manifest_path), Path(feature_cache)
     manifest = json.loads(path.read_text(encoding='utf-8'))
     metadata = json.loads((cache / 'metadata.json').read_text(encoding='utf-8'))
-    if manifest.get('schema_version') != 1 or metadata.get('feature_version') != FEATURE_VERSION:
+    if manifest.get('schema_version') != 1 or metadata.get('feature_version') not in SUPPORTED_FEATURE_VERSIONS:
         raise ValueError('Unsupported manifest or feature version')
+    if (metadata.get('manifest_sha256') is not None
+            and metadata['manifest_sha256'] != hashlib.sha256(path.read_bytes()).hexdigest()):
+        raise ValueError('Cache manifest fingerprint does not match')
     backbone_sha = metadata.get('backbone_sha256', '')
     if not isinstance(backbone_sha, str) or not re.fullmatch('[a-f0-9]{64}', backbone_sha):
         raise ValueError('Invalid backbone checksum provenance')
@@ -124,6 +128,6 @@ def load_dataset(manifest_path, feature_cache):
         groups.append(group)
     return dict(source_manifest=manifest, rows=rows, groups=sorted(groups, key=lambda g: g['group_id']),
                 classes=[dict(type=t, title=TITLES[t]) for t in classes],
-                feature_version=FEATURE_VERSION, backbone_sha256=backbone_sha,
+                feature_version=metadata['feature_version'], backbone_sha256=backbone_sha,
                 manifest_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                 cache_metadata_sha256=hashlib.sha256((cache / 'metadata.json').read_bytes()).hexdigest())

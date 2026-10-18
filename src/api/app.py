@@ -25,6 +25,10 @@ from src.vision.scenario_contracts import ANALYSIS_CALLABLES
 
 logger = logging.getLogger(__name__)
 _CHUNK_SIZE = 1024 * 1024
+_EXPERIMENTAL_ANALYZERS = {
+    "src.vision.safe_classifier:analyze_video": "safe_state",
+    "src.vision.scenario_classifier:analyze_video": "bank_scenarios",
+}
 
 
 class ApiRequestGuard:
@@ -90,7 +94,8 @@ class SafeAnalysisFailure(RuntimeError):
 
 def _remove_upload(path: str | Path) -> None:
     """Remove one job's temporary movie, calibration, and analyzer selection."""
-    for target in (Path(path), Path(str(path) + ".roi.json"), Path(str(path) + ".analysis.json")):
+    for target in (Path(path), Path(str(path) + ".roi.json"), Path(str(path) + ".analysis.json"),
+                   Path(str(path) + ".api-mode.json")):
         with suppress(OSError):
             target.unlink()
 
@@ -288,7 +293,7 @@ def _public_result(job_id: str, result_json: str | None, demo: int) -> dict[str,
     }
     # Ruleset metadata is safe to expose and useful to clients when supplied.
     for key in ("ruleset_version", "ruleset_hash", "model_version", "analysis_scope", "summary", "observations",
-                "feature_version", "score_semantics", "class_results", "limitations"):
+                "feature_version", "score_semantics", "class_results", "limitations", "model_support_policy"):
         if key in payload:
             response[key] = payload[key]
     for key in ("rule", "rule_metadata", "ruleset"):
@@ -335,6 +340,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     with suppress(Exception):
                         await asyncio.shield(analysis_task)
                     raise
+                try:
+                    api_mode = json.loads(
+                        Path(video_path + ".api-mode.json").read_text(encoding="utf-8")
+                    )["analysis_type"]
+                except (OSError, ValueError, KeyError, TypeError):
+                    raise SafeAnalysisFailure("Analysis mode metadata is unavailable") from None
+                if api_mode == "jury" and (
+                    result.get("analysis_scope") is not None
+                    or result.get("verdict") not in {"violation", "no_violation"}
+                ):
+                    raise SafeAnalysisFailure(
+                        "Configured analyzer is not jury-compatible; select an explicit experimental mode"
+                    )
                 demo = bool(result.get("demo", configured.analyzer_mode == "demo"))
                 encoded = json.dumps(result, ensure_ascii=False)
                 with _connect(configured) as db:
@@ -432,10 +450,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         selections = (await request.form()).getlist("analysis_type")
         if selections and (len(selections) != 1 or analysis_type not in ANALYSIS_CALLABLES):
             raise HTTPException(status_code=422, detail="Select safe_state or bank_scenarios")
-        if analysis_type is not None and configured.analyzer_mode != "real":
+        inferred_default = (_EXPERIMENTAL_ANALYZERS.get(configured.analyzer_callable, "jury")
+                            if configured.analyzer_mode == "real" else "jury")
+        selected_type = analysis_type or configured.default_analysis_type or inferred_default
+        explicit_route = analysis_type is not None or configured.default_analysis_type is not None
+        if selected_type != "jury" and configured.analyzer_mode != "real":
             raise HTTPException(status_code=422, detail="Analyzer selection requires real mode")
-        needs_roi = analysis_type == "safe_state" or (
-            analysis_type is None and configured.analyzer_mode == "real"
+        if (selected_type == "jury" and configured.analyzer_mode == "real"
+                and configured.analyzer_callable in _EXPERIMENTAL_ANALYZERS):
+            raise HTTPException(
+                status_code=409,
+                detail="The configured analyzer is experimental and cannot serve the jury verdict contract; choose an explicit experimental mode or configure a jury-compatible analyzer",
+            )
+        needs_roi = selected_type == "safe_state" or (
+            selected_type == "jury" and configured.analyzer_mode == "real"
             and configured.analyzer_callable == ANALYSIS_CALLABLES["safe_state"]
         )
         selected_roi = _parse_roi(roi, needs_roi)
@@ -470,10 +498,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail="Uploaded file is empty")
             if selected_roi is not None:
                 Path(str(target) + ".roi.json").write_text(json.dumps({"roi": selected_roi}), encoding="utf-8")
-            if analysis_type is not None:
+            if selected_type != "jury" and explicit_route:
                 Path(str(target) + ".analysis.json").write_text(
-                    json.dumps({"analysis_type": analysis_type}), encoding="utf-8"
+                    json.dumps({"analysis_type": selected_type}), encoding="utf-8"
                 )
+            Path(str(target) + ".api-mode.json").write_text(
+                json.dumps({"analysis_type": selected_type}), encoding="utf-8"
+            )
         except BaseException:
             _remove_upload(target)
             async with lock:
@@ -535,5 +566,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if row["status"] == "failed":
             response["error"] = row["error"] or "Analysis failed"
         return response
+
+    @app.get("/api/v1/readiness")
+    async def readiness(x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+        """Report routing and declared contract readiness without loading a model."""
+        require_key(x_api_key)
+        configured_experimental = _EXPERIMENTAL_ANALYZERS.get(configured.analyzer_callable)
+        default_mode = configured.default_analysis_type or (configured_experimental if configured.analyzer_mode == "real" else None) or "jury"
+        effective_mode = (
+            "rejected_experimental_default"
+            if configured.analyzer_mode == "real" and configured.default_analysis_type == "jury" and configured_experimental is not None
+            else default_mode
+        )
+        configured_route = configured_experimental if effective_mode == "rejected_experimental_default" else effective_mode
+        configured_for_jury = effective_mode == "jury"
+        compatible = (
+            False
+            if (configured.analyzer_mode == "demo" or configured_experimental is not None
+                or effective_mode in {"safe_state", "bank_scenarios", "rejected_experimental_default"})
+            else None
+        )
+        model_configured = (
+            bool(configured.model_path)
+            if configured_route == "jury"
+            else bool(configured.model_path)
+            if configured_route == "safe_state" or configured.default_analysis_type is None
+            else bool(configured.scenario_model_path)
+        )
+        reason = (
+            "The configured analyzer uses an experimental scoped verdict contract."
+            if configured_experimental is not None and effective_mode == "rejected_experimental_default"
+            else "Demo mode returns a synthetic result, not a jury analysis."
+            if configured.analyzer_mode == "demo"
+            else "Jury contract compatibility is unknown until a real analyzer output passes runtime validation."
+            if configured_for_jury
+            else "The default route is an explicitly scoped experimental analysis."
+        )
+        return {
+            "api_configured": bool(configured.api_key),
+            "model_configured": model_configured,
+            "model_load_verified": False,
+            "analyzer_mode": configured.analyzer_mode,
+            "default_analysis_type": effective_mode,
+            "omitted_analysis_type_routes_to": effective_mode,
+            "configured_for_jury_contract": configured_for_jury,
+            "jury_contract_compatible": compatible,
+            "jury_contract_basis": reason,
+            "analysis_timeout_sec": configured.analyzer_timeout_sec,
+            "maximum_analysis_deadline_sec": 300,
+            "experimental_modes": ["safe_state", "bank_scenarios"],
+        }
 
     return app

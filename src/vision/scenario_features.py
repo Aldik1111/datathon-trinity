@@ -15,6 +15,8 @@ import numpy as np
 from .video_io import iter_sampled_frames
 
 FEATURE_VERSION = 'mobilenetv2-gap-temporal-v1'
+RESIDUAL_FEATURE_VERSION = 'mobilenetv2-gap-temporal-residual-v2'
+SUPPORTED_FEATURE_VERSIONS = {FEATURE_VERSION, RESIDUAL_FEATURE_VERSION}
 BACKBONE_SHA256 = 'c0c3f76d93fa3fd6580652a45618618a220fced18babf65774ed169de0432ad5'
 BACKBONE_URL = 'https://media.githubusercontent.com/media/onnx/models/main/validated/vision/classification/mobilenet/model/mobilenetv2-12.onnx'
 SAMPLE_FPS = 1.0
@@ -79,7 +81,28 @@ def temporal_features(timestamps: np.ndarray, embeddings: np.ndarray) -> np.ndar
     return np.asarray(output, dtype=np.float32)
 
 
-def extract_video_features(path, backbone_path, *, encoder=None) -> tuple[np.ndarray, np.ndarray]:
+def scene_residual_features(features: np.ndarray) -> np.ndarray:
+    """Remove a clip's constant appearance, retaining its changes and deltas.
+
+    The median is computed from this clip only, with no labels or fitted state.
+    This is an offline whole-clip transform, not a streaming detector. It is an
+    experimental background-ablation feature, not an object/action detector.
+    """
+    vectors = np.asarray(features, dtype=np.float32)
+    if (vectors.ndim != 2 or not len(vectors) or vectors.shape[1] != FEATURE_DIM
+            or not np.isfinite(vectors).all()):
+        raise ValueError('Invalid temporal features for scene residuals')
+    result = vectors.copy()
+    center = np.median(vectors[:, :256], axis=0)
+    result[:, :256] -= center
+    result[:, 256:512] -= center
+    return result
+
+
+def extract_video_features(path, backbone_path, *, encoder=None,
+                           feature_version=FEATURE_VERSION) -> tuple[np.ndarray, np.ndarray]:
+    if feature_version not in SUPPORTED_FEATURE_VERSIONS:
+        raise ValueError('Unsupported feature version')
     encoder = encoder if encoder is not None else FrameEncoder(backbone_path)
     times, vectors = [], []
     for timestamp, frame in iter_sampled_frames(path, sample_fps=SAMPLE_FPS):
@@ -89,4 +112,6 @@ def extract_video_features(path, backbone_path, *, encoder=None) -> tuple[np.nda
     features = temporal_features(timestamps, np.asarray(vectors))
     if features.shape[1] != FEATURE_DIM:
         raise ValueError('Unexpected scenario feature dimensions')
+    if feature_version == RESIDUAL_FEATURE_VERSION:
+        features = scene_residual_features(features)
     return timestamps, features
