@@ -96,7 +96,7 @@ def test_inference_is_pixel_based_and_outputs_candidate_window_evidence(tmp_path
     vectors[:, 0] = [-2, 1, 2, -2]
     # Only external backbone extraction is substituted; scoring, intervals,
     # real media decoding and evidence encoding are exercised.
-    monkeypatch.setattr(module, 'extract_video_features', lambda path, backbone: (np.arange(4.), vectors))
+    monkeypatch.setattr(module, 'extract_video_features', lambda path, backbone, **kwargs: (np.arange(4.), vectors))
     result = module.analyze_video(str(video))
     assert result['analysis_scope'] == 'bank_scenarios'
     assert result['verdict'] == 'review_required'

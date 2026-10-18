@@ -34,7 +34,7 @@ def test_reject_inconsistent_verdict(raw):
         normalize_result(raw, 2, {})
 
 
-@pytest.mark.parametrize('timestamp', [-1, float('nan'), float('inf'), 3, True, '0.5'])
+@pytest.mark.parametrize('timestamp', [-1, float('nan'), float('inf'), 2.001, 3, True, '0.5'])
 def test_reject_invalid_timestamps(timestamp):
     with pytest.raises(AnalysisError):
         normalize_result(AnalysisResult('violation', [event(timestamp)]), 2, {})
@@ -48,6 +48,12 @@ def test_reject_invalid_evidence(frames):
 
 def test_no_violation_is_empty():
     assert normalize_result(AnalysisResult('no_violation'), 2, {}) == {'verdict': 'no_violation', 'violations': []}
+
+
+@pytest.mark.parametrize('duration', [0, -1, True, float('nan'), float('inf'), None])
+def test_no_negative_verdict_without_valid_video_duration(duration):
+    with pytest.raises(AnalysisError):
+        normalize_result(AnalysisResult('no_violation'), duration, {})
 
 
 def test_only_verified_rules_are_exposed(tmp_path):

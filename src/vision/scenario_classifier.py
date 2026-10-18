@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from zipfile import BadZipFile
 
 import cv2
 import numpy as np
@@ -13,6 +14,10 @@ import numpy as np
 from .scenario_features import (BACKBONE_SHA256, FEATURE_DIM, FEATURE_VERSION, SAMPLE_FPS,
                                 SUPPORTED_FEATURE_VERSIONS, extract_video_features)
 from .video_io import iter_sampled_frames
+
+
+class ScenarioModelError(ValueError):
+    """A fixed error for local artifact loading; never includes paths or data."""
 
 
 @dataclass
@@ -86,8 +91,8 @@ def load_model(directory) -> ScenarioModel:
         if not np.array_equal(arrays['supported'], expected):
             raise ValueError('Class support and availability disagree')
         return ScenarioModel(metadata=metadata, **arrays)
-    except (OSError, ValueError, TypeError, KeyError, EOFError) as exc:
-        raise ValueError('Invalid or missing scenario model') from exc
+    except (OSError, ValueError, TypeError, KeyError, EOFError, BadZipFile) as exc:
+        raise ScenarioModelError('Invalid or missing scenario model') from exc
 
 
 def score_features(model: ScenarioModel, timestamps, features) -> tuple[list[dict], np.ndarray]:
@@ -126,7 +131,8 @@ def analyze_video(video_path: str) -> dict:
     model = load_model(directory)
     cv2.setNumThreads(4)
     kwargs = {} if model.metadata['feature_version'] == FEATURE_VERSION else dict(feature_version=model.metadata['feature_version'])
-    timestamps, vectors = extract_video_features(video_path, directory / 'backbone.onnx', **kwargs)
+    coverage = {}
+    timestamps, vectors = extract_video_features(video_path, directory / 'backbone.onnx', coverage=coverage, **kwargs)
     classes, scores = score_features(model, timestamps, vectors)
     events, needed = [], set()
     for index, result in enumerate(classes):
@@ -157,11 +163,13 @@ def analyze_video(video_path: str) -> dict:
         event['evidence_frames'] = [evidence[t] for t in event.pop('_points')]
     return dict(analysis_scope='bank_scenarios', verdict='review_required' if events else 'no_candidate',
                 model_version=model.metadata['model_version'], feature_version=model.metadata['feature_version'],
+                model_artifact_sha256=model.metadata['artifact_sha256'],
+                backbone_sha256=model.metadata['backbone_sha256'],
                 model_support_policy={key: model.metadata.get('support_policy', {}).get(key, 1)
                                       for key in ('min_positive_media_groups', 'min_negative_media_groups')},
                 score_semantics='uncalibrated_model_score',
                 summary=dict(sample_count=len(timestamps), sample_fps=SAMPLE_FPS, events_truncated=False),
-                class_results=classes, events=events, limitations=[
+                class_results=classes, events=events, coverage=coverage, limitations=[
                     'Экспериментальная модель обучена на слабых метках таблицы; спорные причины не стали подтверждёнными.',
                     'Оценка отражает сходство с примерами и не является вероятностью доказанного нарушения.',
                     'На тип приходится мало независимых примеров; один пример не подтверждает перенос на новые видео.',

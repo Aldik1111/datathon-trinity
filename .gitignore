@@ -2,6 +2,7 @@ data/*
 !data/README.md
 artifacts/
 .venv/
+.venv-jury/
 __pycache__/
 *.pyc
 .env
@@ -18,3 +19,4 @@ uploads/
 *.log
 .env.*
 !.env.example
+!.env.jury.example

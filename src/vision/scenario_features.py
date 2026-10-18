@@ -100,12 +100,12 @@ def scene_residual_features(features: np.ndarray) -> np.ndarray:
 
 
 def extract_video_features(path, backbone_path, *, encoder=None,
-                           feature_version=FEATURE_VERSION) -> tuple[np.ndarray, np.ndarray]:
+                           feature_version=FEATURE_VERSION, coverage=None) -> tuple[np.ndarray, np.ndarray]:
     if feature_version not in SUPPORTED_FEATURE_VERSIONS:
         raise ValueError('Unsupported feature version')
     encoder = encoder if encoder is not None else FrameEncoder(backbone_path)
     times, vectors = [], []
-    for timestamp, frame in iter_sampled_frames(path, sample_fps=SAMPLE_FPS):
+    for timestamp, frame in iter_sampled_frames(path, sample_fps=SAMPLE_FPS, coverage=coverage):
         times.append(timestamp)
         vectors.append(encoder.encode(frame))
     timestamps = np.asarray(times, dtype=np.float64)

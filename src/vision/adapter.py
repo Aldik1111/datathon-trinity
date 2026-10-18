@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib
 import json
 import math
@@ -26,7 +27,7 @@ def _number(value: Any, duration: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise AnalysisError("Invalid event or frame timestamp")
     value = float(value)
-    if not math.isfinite(value) or not 0 <= value <= duration + 0.05:
+    if not math.isfinite(value) or not 0 <= value <= duration:
         raise AnalysisError("Event or frame timestamp is outside the video")
     return value
 
@@ -71,6 +72,9 @@ def load_rules(path: str | None) -> dict:
 
 
 def normalize_result(raw: Any, duration: float, rules: dict) -> dict:
+    if (isinstance(duration, bool) or not isinstance(duration, (int, float))
+            or not math.isfinite(duration) or duration <= 0):
+        raise AnalysisError("Video has no usable timing information")
     result = _mapping(raw)
     verdict, events = result.get("verdict"), result.get("events")
     scoped = result.get("analysis_scope") == "safe_state"
@@ -154,6 +158,8 @@ def normalize_result(raw: Any, duration: float, rules: dict) -> dict:
             end = _number(event.get("end_sec"), duration)
             if not start <= violation["timecode_sec"] <= end:
                 raise AnalysisError("Invalid event interval")
+            if any(not start <= frame["timestamp_sec"] <= end for frame in normalized_frames):
+                raise AnalysisError("Evidence timestamp is outside its event interval")
             violation.update(start_sec=start, end_sec=end, confidence=_confidence(event.get("confidence")))
         violations.append(violation)
     return {"verdict": verdict, "violations": violations, **extra}
@@ -216,9 +222,19 @@ def _scenario_metadata(result: dict, events: list, duration: float) -> dict:
         cleaned.append({"type": event_type, "title": _text(row.get("title")),
                         "score": score, "threshold": threshold, "decision": decision,
                         "positive_groups": positive, "negative_groups": negative, "peak_sec": peak})
-    event_types = {_text(_mapping(event).get("event_type")) for event in events}
+    event_type_list = [_text(_mapping(event).get("event_type")) for event in events]
+    event_types = set(event_type_list)
+    if len(event_type_list) != len(event_types):
+        raise AnalysisError("Duplicate scenario events")
     if event_types != candidates or (result["verdict"] == "review_required") != bool(candidates):
         raise AnalysisError("Scenario candidates, events, and verdict are inconsistent")
+    by_type = {row['type']: row for row in cleaned}
+    for raw_event in events:
+        event = _mapping(raw_event)
+        row = by_type[event['event_type']]
+        if (_confidence(event.get('confidence')) != row['score']
+                or _number(event.get('timecode_sec'), duration) != row['peak_sec']):
+            raise AnalysisError("Scenario event does not match its model score and peak")
     limitations = result.get("limitations")
     if not isinstance(limitations, list) or not 1 <= len(limitations) <= 50:
         raise AnalysisError("Scenario analysis requires bounded limitations")
@@ -230,13 +246,38 @@ def _scenario_metadata(result: dict, events: list, duration: float) -> dict:
         raise AnalysisError("Invalid sampling frequency")
     if not isinstance(summary.get("events_truncated"), bool):
         raise AnalysisError("Invalid event truncation flag")
-    return {"analysis_scope": "bank_scenarios", "model_version": _text(result.get("model_version")),
+    extra = {"analysis_scope": "bank_scenarios", "model_version": _text(result.get("model_version")),
             "feature_version": _text(result.get("feature_version")),
             "score_semantics": "uncalibrated_model_score", "class_results": cleaned,
             "model_support_policy": dict(policy),
             "limitations": [_text(value) for value in limitations],
             "summary": {"sample_count": summary["sample_count"], "sample_fps": float(sample_fps),
                         "events_truncated": summary["events_truncated"]}}
+    if 'coverage' in result:
+        extra['coverage'] = _coverage_metadata(result['coverage'], duration)
+    return extra
+
+
+def _coverage_metadata(raw: Any, duration: float) -> dict:
+    """Retain only bounded decoder facts; jury projection enforces completeness."""
+    if not isinstance(raw, dict) or type(raw.get('full_decode')) is not bool:
+        raise AnalysisError("Scenario decoder coverage is missing or invalid")
+    times = raw.get('sample_timestamps_sec')
+    if not isinstance(times, list) or not 1 <= len(times) <= 1200:
+        raise AnalysisError("Scenario decoder sample timestamps are invalid")
+    times = [_number(value, duration) for value in times]
+    if any(right <= left for left, right in zip(times, times[1:])):
+        raise AnalysisError("Scenario decoder sample timestamps are unordered")
+    fps = raw.get('sample_fps')
+    if (isinstance(fps, bool) or not isinstance(fps, (int, float))
+            or not math.isfinite(fps) or not 0 < fps <= 30):
+        raise AnalysisError("Invalid sampling frequency")
+    result = {key: _number(raw.get(key), duration) for key in (
+        'first_sample_sec', 'last_sample_sec', 'last_frame_sec', 'duration_sec', 'max_frame_gap_sec')}
+    result.update(full_decode=raw['full_decode'], sample_fps=float(fps),
+                  decoded_frame_count=_count(raw.get('decoded_frame_count')),
+                  sample_count=_count(raw.get('sample_count'), 1200), sample_timestamps_sec=times)
+    return result
 
 
 def _selected_analyzer(video_path: str, settings: Any) -> tuple[str, str | None]:
@@ -309,6 +350,21 @@ def inspect_video(path: str) -> tuple[float, bytes]:
 
 def run_analysis(video_path: str, settings: Any) -> dict:
     analyzer_callable, model_path = _selected_analyzer(video_path, settings)
+    jury = False
+    if getattr(settings, 'jury_analyzer', None) == 'bank_scenarios':
+        try:
+            mode_path = Path(str(video_path) + '.api-mode.json')
+            mode = json.loads(mode_path.read_text(encoding='utf-8'))
+            if (not isinstance(mode, dict) or set(mode) != {'analysis_type'}
+                    or mode['analysis_type'] not in {'jury', 'bank_scenarios', 'safe_state'}):
+                raise ValueError
+            jury = mode['analysis_type'] == 'jury'
+        except (OSError, UnicodeError, ValueError, TypeError):
+            raise AnalysisError('Analysis mode metadata is unavailable') from None
+        if jury and (settings.analyzer_mode != 'real'
+                     or analyzer_callable != ANALYSIS_CALLABLES['bank_scenarios']
+                     or model_path != settings.scenario_model_path):
+            raise AnalysisError('Jury route requires the configured local scenario analyzer')
     duration, first_jpeg = inspect_video(str(video_path))
     if settings.analyzer_mode == "demo":
         # This deliberately synthetic event tests plumbing, not recognition.
@@ -331,9 +387,38 @@ def run_analysis(video_path: str, settings: Any) -> dict:
             raise AnalysisError("Local model is not installed. Configure ANALYZER_CALLABLE and MODEL_PATH") from None
         try:
             raw = analyzer(str(video_path))
-        except Exception:
+        except Exception as exc:
+            if jury:
+                from .scenario_classifier import ScenarioModelError
+                if isinstance(exc, ScenarioModelError):
+                    raise AnalysisError('Jury scenario model could not be loaded; check its local artifacts') from None
             raise AnalysisError("Local model failed to analyze the video") from None
         rules = load_rules(settings.rules_path)
+    if jury:
+        # Presentation timestamps from the model's complete AV decode are the
+        # authoritative clock for its samples and evidence (also for VFR MOV).
+        coverage = raw.get('coverage') if isinstance(raw, dict) else None
+        if not isinstance(coverage, dict):
+            raise AnalysisError('Scenario decoder coverage is missing or invalid')
+        duration = coverage.get('duration_sec')
     result = normalize_result(raw, duration, rules)
     result["demo"] = settings.analyzer_mode == "demo"
+    if jury:
+        from .jury_projection import project_scenario_result
+
+        result = project_scenario_result(result, duration)
+        try:
+            with Path(video_path).open('rb') as source:
+                input_sha256 = hashlib.file_digest(source, 'sha256').hexdigest()
+        except OSError:
+            raise AnalysisError('Cannot verify the uploaded video') from None
+        result['video_duration_sec'] = duration
+        result['provenance'] = {
+            'actual_analyzer': analyzer_callable,
+            'analysis_type': 'bank_scenarios',
+            'execution': 'local',
+            'input_sha256': input_sha256,
+            'model_artifact_sha256': raw['model_artifact_sha256'],
+            'backbone_sha256': raw['backbone_sha256'],
+        }
     return result
