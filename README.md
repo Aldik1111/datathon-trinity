@@ -36,12 +36,13 @@ Python 3.12. Команды из корня репозитория:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-ml.txt
 .\.venv\Scripts\python.exe scripts/init_env.py
 .\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
 Генератор создаёт .env со случайным API-ключом, существующий файл не меняет.
+`requirements-ml.txt` включает зависимости сервиса, обучения и полного набора тестов.
 В .env установите ANALYZER_MODE=demo для демонстрации. Ключ не публикуйте.
 Запустите два терминала:
 
