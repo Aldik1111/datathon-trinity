@@ -15,7 +15,7 @@ from src.ui.client import APISettings, submit_video
 
 
 APP = Path(__file__).resolve().parents[1] / "src/ui/app.py"
-SAFE_ENV = {"ANALYZER_CALLABLE": "src.vision.safe_classifier:analyze_video", "API_KEY": "test-key"}
+SAFE_ENV = {"ANALYZER_CALLABLE": "src.vision.safe_classifier:analyze_video", "API_KEY": "test-key", "SCENARIO_MODEL_PATH": ""}
 
 
 def rendered(at):

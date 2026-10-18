@@ -76,6 +76,7 @@ class StreamlitAppTests(unittest.TestCase):
         environment = patch.dict(os.environ, {
             "ANALYZER_CALLABLE": "src.vision.analyzer:analyze_video",
             "ANALYZER_MODE": "demo",
+            "SCENARIO_MODEL_PATH": "",
         })
         environment.start()
         self.addCleanup(environment.stop)

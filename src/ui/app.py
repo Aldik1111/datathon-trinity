@@ -25,6 +25,7 @@ from src.ui.client import (
     load_settings,
     submit_video,
 )
+from src.ui import scenario_view
 
 
 st.set_page_config(page_title="Проверка видео", page_icon="🎥", layout="centered")
@@ -85,6 +86,9 @@ def _render_violation(event: Any, index: int) -> None:
 
 
 def _render_result(job: dict[str, Any]) -> None:
+    if job.get("analysis_scope") == "bank_scenarios":
+        scenario_view.render_result(job)
+        return
     if job.get("analysis_scope") == "safe_state":
         _render_safe_result(job)
         return
@@ -229,7 +233,7 @@ def _reset_roi_confirmation() -> None:
     st.session_state.roi_confirmed = False
 
 
-def _safe_upload() -> None:
+def _safe_upload(analysis_type: str | None = None) -> None:
     st.write("Выберите исходное MOV и проверьте область сейфа на кадре перед анализом.")
     st.caption("Модель распознаёт только открытое/закрытое состояние сейфа. Неопределённый результат требует проверки.")
     source = st.radio("Источник видео", ["Загрузить MOV", "Локальные примеры"], horizontal=True)
@@ -253,7 +257,7 @@ def _safe_upload() -> None:
         upload = st.file_uploader("Видео в формате .mov", type=["mov"], accept_multiple_files=False)
         if upload is not None:
             filename, content = upload.name, upload.getvalue()
-            identity = hashlib.sha256(content).hexdigest()
+            identity = f"{filename}:{hashlib.sha256(content).hexdigest()}"
         st.caption("Для нового видео вручную задайте область сейфа. Начальная рамка охватывает весь кадр и требует изменения или явного подтверждения.")
     if st.session_state.get("roi_source") != identity:
         st.session_state.roi_source = identity
@@ -289,9 +293,11 @@ def _safe_upload() -> None:
         else:
             try:
                 original = content if content is not None else Path(path).read_bytes()
-                _accept_job(submit_video(load_settings(), filename, original, roi=roi))
+                options = {"analysis_type": analysis_type} if analysis_type is not None else {}
+                _accept_job(submit_video(load_settings(), filename, original, roi=roi, **options))
                 st.session_state.job_source_identity = identity
                 st.session_state.job_filename = filename
+                st.session_state.job_analysis_type = "safe_state"
             except (APIClientError, OSError) as exc:
                 st.error(str(exc) if isinstance(exc, APIClientError) else "Не удалось прочитать локальное видео.")
 
@@ -340,17 +346,6 @@ def _job_fragment() -> None:
     if not job_id:
         return
 
-    if os.getenv("ANALYZER_CALLABLE") == "src.vision.safe_classifier:analyze_video":
-        selected = st.session_state.get("selected_video_identity", "none")
-        analyzed = st.session_state.get("job_source_identity")
-        if selected != "none" and selected != analyzed:
-            st.warning("Выбранное видео ещё не анализировалось; ниже результат предыдущего запуска.")
-        filename = st.session_state.get("job_filename")
-        if filename:
-            st.markdown(f"**Результат для видео: {filename}**")
-        else:
-            st.caption("Сохранённый результат отдельного запуска")
-
     status = st.session_state.get("job_status", "processing")
     if status == "processing":
         st.info("Видео анализируется. Состояние обновляется автоматически.")
@@ -374,6 +369,21 @@ def _job_fragment() -> None:
             st.warning(str(exc))
             return
 
+    selected_mode = st.session_state.get("selected_analysis_type")
+    analyzed_mode = st.session_state.get("job_analysis_type") or st.session_state.get("job_data", {}).get("analysis_scope")
+    if selected_mode in scenario_view.MODE_TITLES or analyzed_mode in scenario_view.MODE_TITLES:
+        selected = st.session_state.get("selected_video_identity", "none")
+        analyzed = st.session_state.get("job_source_identity")
+        if (selected != "none" and selected != analyzed) or (analyzed_mode and selected_mode != analyzed_mode):
+            st.warning("Выбранное видео или режим ещё не анализировались; ниже результат предыдущего запуска.")
+        filename = st.session_state.get("job_filename")
+        if filename:
+            st.markdown(f"**Результат для видео: {filename}**")
+        else:
+            st.caption("Сохранённый результат отдельного запуска; исходное имя файла недоступно.")
+        if analyzed_mode in scenario_view.MODE_TITLES:
+            st.caption(f"Режим результата: {scenario_view.MODE_TITLES[analyzed_mode]}")
+
     _show_demo_warning(bool(st.session_state.get("job_data", {}).get("demo", False)))
     if status == "done":
         _render_result(st.session_state.get("job_data", {}))
@@ -391,6 +401,7 @@ def main() -> None:
         st.session_state.job_data = {}
         st.session_state.pop("job_source_identity", None)
         st.session_state.pop("job_filename", None)
+        st.session_state.pop("job_analysis_type", None)
     st.title("Проверка видео")
     st.write("Загрузите видео .mov, чтобы запустить локальный анализ.")
     st.caption("Видео обрабатывается локальным сервисом и не отправляется облачному AI-сервису.")
@@ -399,8 +410,18 @@ def main() -> None:
     )
 
     safe_mode = os.getenv("ANALYZER_CALLABLE") == "src.vision.safe_classifier:analyze_video"
-    if safe_mode:
-        _safe_upload()
+    scenario_available = bool(os.getenv("SCENARIO_MODEL_PATH", "").strip())
+    if scenario_available:
+        mode = st.radio("Режим анализа", list(scenario_view.MODE_TITLES), format_func=scenario_view.MODE_TITLES.get,
+                        horizontal=True, key="analysis_mode")
+    else:
+        mode = "safe_state" if safe_mode else "legacy"
+    st.session_state.selected_analysis_type = mode
+    if mode == "bank_scenarios":
+        scenario_view.upload(_accept_job)
+        scenario_view.comparison_report()
+    elif mode == "safe_state":
+        _safe_upload(analysis_type="safe_state" if scenario_available else None)
         _show_model_report()
     else:
         with st.form("video_upload", clear_on_submit=False):

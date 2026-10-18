@@ -17,10 +17,11 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from .settings import Settings, get_settings
+from src.vision.scenario_contracts import ANALYSIS_CALLABLES
 
 logger = logging.getLogger(__name__)
 _CHUNK_SIZE = 1024 * 1024
@@ -88,8 +89,8 @@ class SafeAnalysisFailure(RuntimeError):
 
 
 def _remove_upload(path: str | Path) -> None:
-    """Remove one job's temporary movie and its calibration sidecar together."""
-    for target in (Path(path), Path(str(path) + ".roi.json")):
+    """Remove one job's temporary movie, calibration, and analyzer selection."""
+    for target in (Path(path), Path(str(path) + ".roi.json"), Path(str(path) + ".analysis.json")):
         with suppress(OSError):
             target.unlink()
 
@@ -250,7 +251,7 @@ def _run_child(
 def _public_result(job_id: str, result_json: str | None, demo: int) -> dict[str, Any]:
     payload = json.loads(result_json or "{}")
     verdict = payload.get("verdict")
-    if verdict not in {"violation", "no_violation", "review_required", "no_event"}:
+    if verdict not in {"violation", "no_violation", "review_required", "no_event", "no_candidate"}:
         raise RuntimeError("Analyzer returned an invalid verdict")
     raw_violations = payload.get("violations", [])
     if not isinstance(raw_violations, list):
@@ -286,7 +287,8 @@ def _public_result(job_id: str, result_json: str | None, demo: int) -> dict[str,
         "demo": bool(demo),
     }
     # Ruleset metadata is safe to expose and useful to clients when supplied.
-    for key in ("ruleset_version", "ruleset_hash", "model_version", "analysis_scope", "summary", "observations"):
+    for key in ("ruleset_version", "ruleset_hash", "model_version", "analysis_scope", "summary", "observations",
+                "feature_version", "score_semantics", "class_results", "limitations"):
         if key in payload:
             response[key] = payload[key]
     for key in ("rule", "rule_metadata", "ruleset"):
@@ -418,11 +420,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/v1/analyze", status_code=202)
     async def analyze_video(
+        request: Request,
         file: UploadFile = File(...), x_api_key: str | None = Header(default=None),
         roi: str | None = Form(default=None),
+        analysis_type: str | None = Form(default=None),
     ) -> JSONResponse:
         require_key(x_api_key)
-        selected_roi = _parse_roi(roi, configured.analyzer_mode == "real" and configured.analyzer_callable == "src.vision.safe_classifier:analyze_video")
+        # FastAPI converts an empty optional form string to its default. Inspect
+        # the cached form too, so an explicitly empty/duplicate selection is not
+        # silently treated as the omitted field used by older clients.
+        selections = (await request.form()).getlist("analysis_type")
+        if selections and (len(selections) != 1 or analysis_type not in ANALYSIS_CALLABLES):
+            raise HTTPException(status_code=422, detail="Select safe_state or bank_scenarios")
+        if analysis_type is not None and configured.analyzer_mode != "real":
+            raise HTTPException(status_code=422, detail="Analyzer selection requires real mode")
+        needs_roi = analysis_type == "safe_state" or (
+            analysis_type is None and configured.analyzer_mode == "real"
+            and configured.analyzer_callable == ANALYSIS_CALLABLES["safe_state"]
+        )
+        selected_roi = _parse_roi(roi, needs_roi)
         _cleanup_expired(configured)
         if not file.filename or Path(file.filename).suffix.lower() != ".mov":
             raise HTTPException(status_code=415, detail="Only .mov files are accepted")
@@ -454,6 +470,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail="Uploaded file is empty")
             if selected_roi is not None:
                 Path(str(target) + ".roi.json").write_text(json.dumps({"roi": selected_roi}), encoding="utf-8")
+            if analysis_type is not None:
+                Path(str(target) + ".analysis.json").write_text(
+                    json.dumps({"analysis_type": analysis_type}), encoding="utf-8"
+                )
         except BaseException:
             _remove_upload(target)
             async with lock:

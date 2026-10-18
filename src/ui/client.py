@@ -86,16 +86,22 @@ def _json_object(response: requests.Response, api_key: str = "") -> dict[str, An
 
 
 def submit_video(
-    settings: APISettings, filename: str, video_bytes: bytes, roi: list[float] | None = None
+    settings: APISettings, filename: str, video_bytes: bytes, roi: list[float] | None = None,
+    analysis_type: str | None = None,
 ) -> dict[str, Any]:
     """Submit one .mov file and return the API's job response."""
     if Path(filename).suffix.lower() != ".mov":
         raise APIClientError("Поддерживаются видеофайлы в формате .mov.")
     if not video_bytes:
         raise APIClientError("Выбранный файл пуст.")
+    if analysis_type is not None and analysis_type not in ("safe_state", "bank_scenarios"):
+        raise APIClientError("Неизвестный режим анализа.")
     try:
-        # Keep the original demo request byte-for-byte compatible when no ROI is supplied.
-        extra = {"data": {"roi": json.dumps(roi)}} if roi is not None else {}
+        # Omission preserves the original configured-analyzer request.
+        data = {"roi": json.dumps(roi)} if roi is not None else {}
+        if analysis_type is not None:
+            data["analysis_type"] = analysis_type
+        extra = {"data": data} if data else {}
         response = requests.post(
             f"{settings.base_url}/api/v1/analyze",
             headers=_headers(settings),

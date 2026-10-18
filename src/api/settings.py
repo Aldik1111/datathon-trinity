@@ -22,6 +22,7 @@ class Settings:
     max_pending_jobs: int = 8
     job_ttl_sec: int = 24 * 60 * 60
     db_path: Path | None = None
+    scenario_model_path: str | None = None
 
     def __post_init__(self) -> None:
         if not self.api_key:
@@ -53,6 +54,7 @@ def get_settings() -> Settings:
         upload_dir=upload_dir,
         max_upload_mb=int(os.getenv("MAX_UPLOAD_MB", "100")),
         model_path=os.getenv("MODEL_PATH") or None,
+        scenario_model_path=os.getenv("SCENARIO_MODEL_PATH") or None,
         analyzer_mode=os.getenv("ANALYZER_MODE", "real").lower(),
         analyzer_callable=os.getenv(
             "ANALYZER_CALLABLE", "src.vision.analyzer:analyze_video"
