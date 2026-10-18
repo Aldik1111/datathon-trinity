@@ -31,6 +31,9 @@ API POST /api/v1/analyze accepts optional multipart roi JSON list, validates fin
 
 ## Progress
 
-- Fresh main cloned; branch created; dependencies installing.
+- Completed: isolated checkout, installed dependencies, frozen dataset and trained CPU model.
 - Ruling: use an explicitly calibrated ROI because camera positions differ. No automatic object localization claim.
 - Ruling: proceed with the user-authorized preparation and existing first-safe scope; avoid another permission round for implementation details.
+- Verified: 85 tests pass; independent review completed; real HTTP runs on held-out X-39 and X-26; browser submission on X-39 and persisted result loading work.
+- Preserved original annotations and media. Local Windows start/stop launchers were tested through restart; source and numeric model artifacts are packaged together.
+- Result provenance is explicit when the selected input changes or a saved job is loaded.

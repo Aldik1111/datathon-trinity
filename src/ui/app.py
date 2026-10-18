@@ -260,6 +260,7 @@ def _safe_upload() -> None:
         for key, value in zip(("roi_x", "roi_y", "roi_w", "roi_h"), preset):
             st.session_state[key] = float(value)
         st.session_state.roi_confirmed = False
+    st.session_state.selected_video_identity = identity
     st.markdown("**Область сейфа (ROI)**")
     st.caption("Координаты от 0 до 1: X/Y — левый верхний угол, ширина/высота — доли кадра. Рамка должна содержать сейф.")
     columns = st.columns(4)
@@ -289,6 +290,8 @@ def _safe_upload() -> None:
             try:
                 original = content if content is not None else Path(path).read_bytes()
                 _accept_job(submit_video(load_settings(), filename, original, roi=roi))
+                st.session_state.job_source_identity = identity
+                st.session_state.job_filename = filename
             except (APIClientError, OSError) as exc:
                 st.error(str(exc) if isinstance(exc, APIClientError) else "Не удалось прочитать локальное видео.")
 
@@ -337,6 +340,17 @@ def _job_fragment() -> None:
     if not job_id:
         return
 
+    if os.getenv("ANALYZER_CALLABLE") == "src.vision.safe_classifier:analyze_video":
+        selected = st.session_state.get("selected_video_identity", "none")
+        analyzed = st.session_state.get("job_source_identity")
+        if selected != "none" and selected != analyzed:
+            st.warning("Выбранное видео ещё не анализировалось; ниже результат предыдущего запуска.")
+        filename = st.session_state.get("job_filename")
+        if filename:
+            st.markdown(f"**Результат для видео: {filename}**")
+        else:
+            st.caption("Сохранённый результат отдельного запуска")
+
     status = st.session_state.get("job_status", "processing")
     if status == "processing":
         st.info("Видео анализируется. Состояние обновляется автоматически.")
@@ -375,6 +389,8 @@ def main() -> None:
         st.session_state.job_id = requested_job
         st.session_state.job_status = "processing"
         st.session_state.job_data = {}
+        st.session_state.pop("job_source_identity", None)
+        st.session_state.pop("job_filename", None)
     st.title("Проверка видео")
     st.write("Загрузите видео .mov, чтобы запустить локальный анализ.")
     st.caption("Видео обрабатывается локальным сервисом и не отправляется облачному AI-сервису.")

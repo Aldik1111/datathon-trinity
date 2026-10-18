@@ -132,3 +132,38 @@ def test_report_shows_heldout_sample_size_coverage_and_camera_limitations(tmp_pa
     assert "Only the two source cameras were tested." in text
     assert "не точность обнаружения событий" in text
     assert at.dataframe[0].value.iloc[0]["precision"] == 0.75
+
+
+def test_changing_selected_video_identifies_result_as_previous_run(tmp_path):
+    import cv2
+    import numpy as np
+
+    first = tmp_path / "first.mov"
+    writer = cv2.VideoWriter(str(first), cv2.VideoWriter_fourcc(*"mp4v"), 2, (64, 48))
+    writer.write(np.zeros((48, 64, 3), dtype=np.uint8))
+    writer.release()
+    second = tmp_path / "second.mov"
+    second.write_bytes(first.read_bytes())
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"videos": [{
+        "path": str(path), "filename": path.name, "roi": [0.2, 0.1, 0.4, 0.5],
+        "split": "test", "video_id": path.stem,
+    } for path in (first, second)]}), encoding="utf-8")
+    result = {"job_id": "previous", "status": "done", "analysis_scope": "safe_state", "verdict": "no_event",
+              "observations": [{"timecode_sec": 0, "state": "closed", "confidence": 0.9}], "violations": []}
+    with patch.dict(os.environ, {**SAFE_ENV, "SAFE_DATASET_MANIFEST": str(manifest)}), \
+            patch("src.ui.client.get_job", return_value=result), \
+            patch("src.ui.client.submit_video", return_value={**result, "job_id": "new-job"}):
+        at = AppTest.from_file(str(APP), default_timeout=10)
+        at.query_params["job_id"] = "previous"
+        at.run()
+        at.radio[0].set_value("Локальные примеры").run()
+        assert "результат предыдущего запуска" in rendered(at)
+        at.checkbox(key="roi_confirmed").check().run()
+        next(button for button in at.button if button.label == "Анализировать").click().run()
+        assert "Результат для видео: first.mov" in rendered(at)
+        assert "результат предыдущего запуска" not in rendered(at)
+        at.selectbox[0].set_value(1).run()
+    assert not at.exception
+    assert "результат предыдущего запуска" in rendered(at)
+    assert "Результат для видео: first.mov" in rendered(at)
