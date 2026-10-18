@@ -1,7 +1,9 @@
 import importlib
+import json
 import sqlite3
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +39,130 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(upload.status_code, 401)
         status = self.client.get("/api/v1/jobs/unknown")
         self.assertEqual(status.status_code, 401)
+        readiness = self.client.get("/api/v1/readiness")
+        self.assertEqual(readiness.status_code, 401)
+
+    def test_readiness_reports_default_routing_and_jury_compatibility(self):
+        response = self.client.get("/api/v1/readiness", headers={"X-API-Key": "test-secret"})
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["default_analysis_type"], "jury")
+        self.assertEqual(data["omitted_analysis_type_routes_to"], "jury")
+        self.assertFalse(data["jury_contract_compatible"])
+        self.assertEqual(data["maximum_analysis_deadline_sec"], 300)
+
+    def test_jury_default_rejects_known_experimental_analyzer(self):
+        settings = Settings(
+            api_key="test-secret",
+            upload_dir=Path(self.temp.name) / "experimental-uploads",
+            db_path=Path(self.temp.name) / "experimental.sqlite3",
+            max_upload_mb=1,
+            analyzer_mode="real",
+            analyzer_callable="src.vision.scenario_classifier:analyze_video",
+            default_analysis_type="jury",
+        )
+        with TestClient(api_module.create_app(settings)) as client:
+            response = client.post(
+                "/api/v1/analyze",
+                headers={"X-API-Key": "test-secret"},
+                files={"file": ("clip.mov", b"synthetic", "video/quicktime")},
+            )
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("experimental", response.json()["detail"])
+
+    def test_demo_ignores_real_analyzer_choice_and_remains_synthetic(self):
+        for index, default in enumerate((None, "jury")):
+            with self.subTest(default=default):
+                settings = Settings(api_key="test-secret", max_upload_mb=1,
+                    upload_dir=Path(self.temp.name) / f"demo-uploads-{index}",
+                    analyzer_mode="demo", default_analysis_type=default,
+                    analyzer_callable="src.vision.safe_classifier:analyze_video")
+                with patch.object(api_module, "_run_child", return_value={
+                    "verdict": "no_violation", "violations": [], "demo": True}), \
+                        TestClient(api_module.create_app(settings)) as client:
+                    headers = {"X-API-Key": "test-secret"}
+                    readiness = client.get("/api/v1/readiness", headers=headers).json()
+                    self.assertEqual(readiness["omitted_analysis_type_routes_to"], "jury")
+                    self.assertFalse(readiness["jury_contract_compatible"])
+                    response = client.post("/api/v1/analyze", headers=headers,
+                                           files={"file": ("synthetic.mov", b"synthetic")})
+                    self.assertEqual(response.status_code, 202)
+                    self.assertTrue(response.json()["demo"])
+
+    def test_missing_legacy_analyzer_is_reported_as_unverified_not_ready(self):
+        settings = Settings(
+            api_key="test-secret",
+            upload_dir=Path(self.temp.name) / "missing-uploads",
+            db_path=Path(self.temp.name) / "missing.sqlite3",
+            max_upload_mb=1,
+            analyzer_mode="real",
+            analyzer_callable="src.vision.analyzer:analyze_video",
+        )
+        with TestClient(api_module.create_app(settings)) as client:
+            readiness = client.get("/api/v1/readiness", headers={"X-API-Key": "test-secret"}).json()
+        self.assertTrue(readiness["configured_for_jury_contract"])
+        self.assertIsNone(readiness["jury_contract_compatible"])
+        self.assertFalse(readiness["model_load_verified"])
+
+    def test_explicit_experimental_default_is_not_jury_compatible_for_custom_analyzer(self):
+        settings = Settings(
+            api_key="test-secret",
+            upload_dir=Path(self.temp.name) / "explicit-scenario-uploads",
+            db_path=Path(self.temp.name) / "explicit-scenario.sqlite3",
+            max_upload_mb=1,
+            analyzer_mode="real",
+            analyzer_callable="custom.analyzer:analyze_video",
+            default_analysis_type="bank_scenarios",
+        )
+        with TestClient(api_module.create_app(settings)) as client:
+            readiness = client.get("/api/v1/readiness", headers={"X-API-Key": "test-secret"}).json()
+        self.assertEqual(readiness["default_analysis_type"], "bank_scenarios")
+        self.assertFalse(readiness["jury_contract_compatible"])
+
+    def test_omitted_scenario_mode_preserves_configured_analyzer_and_model_path(self):
+        settings = Settings(
+            api_key="test-secret",
+            upload_dir=Path(self.temp.name) / "scenario-uploads",
+            db_path=Path(self.temp.name) / "scenario.sqlite3",
+            max_upload_mb=1,
+            analyzer_mode="real",
+            analyzer_callable="src.vision.scenario_classifier:analyze_video",
+            model_path="legacy-scenario-model",
+        )
+        observed = []
+
+        def fake_analysis(path, configured, timeout_sec, stop_event=None):
+            selection_path = Path(str(path) + ".analysis.json")
+            mode_path = Path(str(path) + ".api-mode.json")
+            observed.append((selection_path.exists(), mode_path.read_text(encoding="utf-8")))
+            return {"verdict": "no_candidate", "violations": [], "analysis_scope": "bank_scenarios"}
+
+        original = api_module._run_child
+        api_module._run_child = fake_analysis
+        try:
+            with TestClient(api_module.create_app(settings)) as client:
+                accepted = client.post(
+                    "/api/v1/analyze",
+                    headers={"X-API-Key": "test-secret"},
+                    files={"file": ("clip.mov", b"synthetic", "video/quicktime")},
+                )
+                self.assertEqual(accepted.status_code, 202)
+                job_id = accepted.json()["job_id"]
+                result = None
+                deadline = time.time() + 2
+                while time.time() < deadline:
+                    result = client.get(
+                        f"/api/v1/jobs/{job_id}", headers={"X-API-Key": "test-secret"}
+                    ).json()
+                    if result["status"] in {"done", "failed"}:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(result["status"], "done")
+                self.assertEqual(result["verdict"], "no_candidate")
+        finally:
+            api_module._run_child = original
+        self.assertEqual(observed[0][0], False)
+        self.assertEqual(json.loads(observed[0][1]), {"analysis_type": "bank_scenarios"})
 
     def test_rejects_non_mov_and_oversize_uploads(self):
         headers = {"X-API-Key": "test-secret"}

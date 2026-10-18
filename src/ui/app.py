@@ -6,8 +6,15 @@ Run from the repository root with:
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import tempfile
 from typing import Any
 
+from PIL import Image, ImageDraw
 import streamlit as st
 
 from src.ui.client import (
@@ -15,9 +22,11 @@ from src.ui.client import (
     decode_evidence_image,
     format_timecode,
     get_job,
+    get_readiness,
     load_settings,
     submit_video,
 )
+from src.ui import scenario_view
 
 
 st.set_page_config(page_title="Проверка видео", page_icon="🎥", layout="centered")
@@ -78,6 +87,12 @@ def _render_violation(event: Any, index: int) -> None:
 
 
 def _render_result(job: dict[str, Any]) -> None:
+    if job.get("analysis_scope") == "bank_scenarios":
+        scenario_view.render_result(job)
+        return
+    if job.get("analysis_scope") == "safe_state":
+        _render_safe_result(job)
+        return
     verdict = job.get("verdict")
     violations = job.get("violations", [])
 
@@ -97,6 +112,234 @@ def _render_result(job: dict[str, Any]) -> None:
     st.info(
         "Результат автоматического анализа является предварительным. Все события и кадры должен проверить человек."
     )
+
+
+def _render_safe_result(job: dict[str, Any]) -> None:
+    observations = job.get("observations", [])
+    observations = [row for row in observations if isinstance(row, dict)] if isinstance(observations, list) else []
+    events = job.get("violations", [])
+    events = [event for event in events if isinstance(event, dict)] if isinstance(events, list) else []
+    has_open = any(row.get("state") == "open" for row in observations) or any(
+        event.get("type") == "safe_open" for event in events
+    )
+    has_unknown = any(row.get("state") == "unknown" for row in observations) or any(
+        event.get("type") in ("safe_unknown", "safe_uncertain") for event in events
+    )
+    if job.get("verdict") == "review_required":
+        if has_open:
+            st.warning("Сейф открыт — проверьте контекст")
+        else:
+            st.warning("Состояние сейфа неопределённо — требуется ручная проверка")
+    elif job.get("verdict") == "no_event" and not has_unknown and not has_open:
+        st.success("Открытый сейф не обнаружен в проверенных кадрах")
+    else:
+        st.warning("Состояние сейфа требует ручной проверки")
+    if has_unknown:
+        st.warning("Есть неопределённые кадры: проверьте область сейфа и контекст вручную.")
+    st.caption(f"Модель: {job.get('model_version', 'версия не указана')}")
+    summary = job.get("summary")
+    if isinstance(summary, dict):
+        counts = summary.get("state_counts", {})
+        st.write(f"Проверено кадров: {summary.get('sample_count', len(observations))}")
+        if isinstance(counts, dict):
+            st.write(f"Открыт: {counts.get('open', 0)} · Закрыт: {counts.get('closed', 0)} · Неопределённо: {counts.get('unknown', 0)}")
+        if summary.get("events_truncated"):
+            st.warning("Достигнут лимит событий; показаны не все фрагменты.")
+    elif isinstance(summary, str):
+        st.write(summary)
+    if observations:
+        st.markdown("**Наблюдения по времени**")
+        state_labels = {"open": "Открыт", "closed": "Закрыт", "unknown": "Неопределённо"}
+        rows = [{"Время, с": row.get("timecode_sec"), "Состояние": state_labels.get(row.get("state"), "Неопределённо"),
+                 "Оценка уверенности": row.get("confidence")} for row in observations]
+        st.dataframe(rows, hide_index=True, width="stretch")
+        st.caption("Оценка уверенности — оценка модели, не калиброванная вероятность правильности. Между проверенными кадрами события могут быть пропущены.")
+    for event in events:
+        with st.container(border=True):
+            start = format_timecode(event.get("start_sec", event.get("timecode_sec")))
+            end = format_timecode(event.get("end_sec", event.get("timecode_sec")))
+            event_type = event.get("type")
+            event_titles = {"safe_open": "Сейф открыт", "safe_uncertain": "Недостаточная уверенность", "safe_unknown": "Недостаточная уверенность"}
+            st.markdown(f"**{event_titles.get(event_type, 'Фрагмент для проверки')} · {start}–{end}**")
+            if event_type == "safe_open":
+                st.write("В выбранной области обнаружены признаки открытого сейфа. Проверьте кадры и контекст вручную.")
+            elif event_type in ("safe_uncertain", "safe_unknown"):
+                st.write("Модель не смогла уверенно определить состояние сейфа. Проверьте выбранную область и кадры вручную.")
+            elif isinstance(event.get("description"), str):
+                st.write(event["description"])
+            for frame in event.get("evidence_frames", []):
+                if isinstance(frame, dict):
+                    image = decode_evidence_image(frame.get("image_base64"))
+                    if image:
+                        st.image(image, caption=f"Кадр · {format_timecode(frame.get('timestamp_sec'))}", width="stretch")
+    st.info("Область анализа: только открытое/закрытое состояние выбранного сейфа. Это не проверка личности, передач, замков или соблюдения регламентов. Все отмеченные и неопределённые фрагменты проверяет человек.")
+    st.download_button("Скачать результат JSON", json.dumps(job, ensure_ascii=False, indent=2),
+                       file_name=f"safe-result-{job.get('job_id', 'analysis')}.json", mime="application/json")
+
+
+def _valid_roi(value: Any) -> bool:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return False
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in value):
+        return False
+    x, y, w, h = value
+    return x >= 0 and y >= 0 and w > 0 and h > 0 and x + w <= 1 and y + h <= 1
+
+
+def _local_examples() -> list[dict[str, Any]]:
+    manifest = os.getenv("SAFE_DATASET_MANIFEST")
+    if not manifest:
+        return []
+    try:
+        data = json.loads(Path(manifest).read_text(encoding="utf-8"))
+        videos = data.get("videos", [])
+        return [
+            {key: video[key] for key in ("path", "filename", "roi", "split", "video_id")}
+            for video in videos if isinstance(video, dict)
+            and all(key in video for key in ("path", "filename", "roi", "split", "video_id"))
+            and isinstance(video["path"], str) and Path(video["path"]).is_file()
+            and Path(video["path"]).suffix.lower() == ".mov" and _valid_roi(video["roi"])
+        ]
+    except (OSError, ValueError, TypeError, AttributeError):
+        st.warning("Не удалось прочитать список локальных примеров.")
+        return []
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _first_frame(path: str, content: bytes | None = None) -> Image.Image | None:
+    """Decode display-oriented pixels; the original MOV is still sent to the API."""
+    import cv2
+
+    def decode(filename: str) -> Image.Image | None:
+        capture = cv2.VideoCapture(filename)
+        try:
+            capture.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
+            ok, frame = capture.read()
+            return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)) if ok else None
+        finally:
+            capture.release()
+
+    try:
+        if content is None:
+            return decode(path)
+        with tempfile.TemporaryDirectory(prefix="safe-preview-") as temporary:
+            filename = Path(temporary) / "preview.mov"
+            filename.write_bytes(content)
+            return decode(str(filename))
+    except (OSError, cv2.error, ValueError):
+        return None
+
+
+def _reset_roi_confirmation() -> None:
+    st.session_state.roi_confirmed = False
+
+
+def _safe_upload(analysis_type: str | None = None) -> None:
+    st.write("Выберите исходное MOV и проверьте область сейфа на кадре перед анализом.")
+    st.caption("Модель распознаёт только открытое/закрытое состояние сейфа. Неопределённый результат требует проверки.")
+    source = st.radio("Источник видео", ["Загрузить MOV", "Локальные примеры"], horizontal=True)
+    filename, content, path, identity = "", None, None, "none"
+    preset = [0.0, 0.0, 1.0, 1.0]
+    if source == "Локальные примеры":
+        examples = _local_examples()
+        if examples:
+            index = st.selectbox("Исходное видео", range(len(examples)), format_func=lambda i: examples[i]["filename"])
+            example = examples[index]
+            filename, path = example["filename"], example["path"]
+            identity = path
+            preset = example["roi"]
+            split = example["split"]
+            label = {"train": "Обучающий пример", "val": "Валидационный пример", "test": "Отложенный тест — видео не использовалось для обучения"}.get(split, "Разбиение не указано")
+            st.caption(label)
+            st.caption("Предустановленная область — калибровка камеры. Аннотации состояний не передаются модели как предсказания.")
+        else:
+            st.info("Локальные примеры недоступны. Загрузите исходное MOV.")
+    else:
+        upload = st.file_uploader("Видео в формате .mov", type=["mov"], accept_multiple_files=False)
+        if upload is not None:
+            filename, content = upload.name, upload.getvalue()
+            identity = f"{filename}:{hashlib.sha256(content).hexdigest()}"
+        st.caption("Для нового видео вручную задайте область сейфа. Начальная рамка охватывает весь кадр и требует изменения или явного подтверждения.")
+    if st.session_state.get("roi_source") != identity:
+        st.session_state.roi_source = identity
+        for key, value in zip(("roi_x", "roi_y", "roi_w", "roi_h"), preset):
+            st.session_state[key] = float(value)
+        st.session_state.roi_confirmed = False
+    st.session_state.selected_video_identity = identity
+    st.markdown("**Область сейфа (ROI)**")
+    st.caption("Координаты от 0 до 1: X/Y — левый верхний угол, ширина/высота — доли кадра. Рамка должна содержать сейф.")
+    columns = st.columns(4)
+    roi = []
+    for column, key, label in zip(columns, ("roi_x", "roi_y", "roi_w", "roi_h"), ("X", "Y", "Ширина", "Высота")):
+        with column:
+            roi.append(st.number_input(label, min_value=0.0, max_value=1.0, step=0.01, key=key, on_change=_reset_roi_confirmation))
+    valid_roi = _valid_roi(roi)
+    if not valid_roi:
+        st.error("Область должна иметь положительный размер и полностью находиться в кадре: X + ширина ≤ 1, Y + высота ≤ 1.")
+    frame = _first_frame(path or filename, content) if filename else None
+    if frame is not None and valid_roi:
+        preview = frame.copy()
+        x, y, w, h = roi
+        draw = ImageDraw.Draw(preview)
+        draw.rectangle((int(x * frame.width), int(y * frame.height), min(frame.width - 1, int((x + w) * frame.width)), min(frame.height - 1, int((y + h) * frame.height))), outline="#35ff75", width=max(2, frame.width // 250))
+        st.image(preview, caption="Первый кадр с выбранной областью сейфа", width="stretch")
+    elif filename:
+        st.warning("Не удалось показать первый кадр. Выберите читаемый MOV для визуальной проверки области сейфа.")
+    else:
+        st.info("Выберите видео, чтобы увидеть кадр и рамку области сейфа.")
+    confirmed = st.checkbox("Я проверил(а) рамку: в ней находится нужный сейф", key="roi_confirmed")
+    if st.button("Анализировать", type="primary"):
+        if frame is None or not valid_roi or not confirmed:
+            st.error("Покажите кадр и подтвердите корректную область сейфа перед анализом.")
+        else:
+            try:
+                original = content if content is not None else Path(path).read_bytes()
+                options = {"analysis_type": analysis_type} if analysis_type is not None else {}
+                _accept_job(submit_video(load_settings(), filename, original, roi=roi, **options))
+                st.session_state.job_source_identity = identity
+                st.session_state.job_filename = filename
+                st.session_state.job_analysis_type = "safe_state"
+            except (APIClientError, OSError) as exc:
+                st.error(str(exc) if isinstance(exc, APIClientError) else "Не удалось прочитать локальное видео.")
+
+
+def _show_model_report() -> None:
+    report_path = os.getenv("SAFE_MODEL_REPORT")
+    if not report_path and os.getenv("MODEL_PATH"):
+        report_path = str(Path(os.environ["MODEL_PATH"]) / "report.json")
+    with st.expander("Проверка модели и ограничения"):
+        st.write("Базовая модель обучена на кадрах предоставленных камер. Результаты на этих камерах не гарантируют перенос на новые помещения и ракурсы. Редкие кадровые метки не подтверждают точность временных интервалов событий.")
+        if not report_path:
+            st.caption("Отчёт об отложенном тесте не настроен.")
+            return
+        try:
+            report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+            test = report["splits"]["test"]
+            st.write(f"Отложенный тест: {test['samples']} кадров · {test['videos']} видео · {test['groups']} независимых групп.")
+            st.write(f"Классы: {test.get('class_counts', {})}")
+            coverage = test.get("coverage")
+            if isinstance(coverage, (int, float)):
+                st.write(f"Доля кадров без отказа от решения: {coverage:.1%}; неопределённых: {test.get('abstained', 'не указано')}.")
+            metrics = test.get("per_class", {})
+            if isinstance(metrics, dict):
+                st.dataframe([{"класс": name, **values} for name, values in metrics.items() if isinstance(values, dict)], hide_index=True)
+            st.caption("Precision/recall/F1 и матрица ошибок относятся к бинарным решениям до отказа при низкой уверенности. Это кадровые метрики, не точность обнаружения событий.")
+            st.write("Матрица ошибок (строки/столбцы: closed, open):", test.get("confusion_matrix", []))
+            for limitation in report.get("limitations", []):
+                st.caption(str(limitation))
+        except (OSError, ValueError, KeyError, TypeError):
+            st.caption("Отчёт модели пока недоступен или имеет неподдерживаемый формат.")
+
+
+def _accept_job(response: dict[str, Any]) -> None:
+    job_id = response.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        raise APIClientError("API не вернул идентификатор задачи.")
+    st.session_state.job_id = job_id
+    st.session_state.job_status = response.get("status", "processing")
+    st.session_state.job_data = response
+    st.session_state.job_error = "Не удалось обработать видео. Проверьте сервис и попробуйте снова."
+    st.query_params["job_id"] = job_id
 
 
 def _job_fragment() -> None:
@@ -127,6 +370,21 @@ def _job_fragment() -> None:
             st.warning(str(exc))
             return
 
+    selected_mode = st.session_state.get("selected_analysis_type")
+    analyzed_mode = st.session_state.get("job_analysis_type") or st.session_state.get("job_data", {}).get("analysis_scope")
+    if selected_mode in scenario_view.MODE_TITLES or analyzed_mode in scenario_view.MODE_TITLES:
+        selected = st.session_state.get("selected_video_identity", "none")
+        analyzed = st.session_state.get("job_source_identity")
+        if (selected != "none" and selected != analyzed) or (analyzed_mode and selected_mode != analyzed_mode):
+            st.warning("Выбранное видео или режим ещё не анализировались; ниже результат предыдущего запуска.")
+        filename = st.session_state.get("job_filename")
+        if filename:
+            st.markdown(f"**Результат для видео: {filename}**")
+        else:
+            st.caption("Сохранённый результат отдельного запуска; исходное имя файла недоступно.")
+        if analyzed_mode in scenario_view.MODE_TITLES:
+            st.caption(f"Режим результата: {scenario_view.MODE_TITLES[analyzed_mode]}")
+
     _show_demo_warning(bool(st.session_state.get("job_data", {}).get("demo", False)))
     if status == "done":
         _render_result(st.session_state.get("job_data", {}))
@@ -135,32 +393,65 @@ def _job_fragment() -> None:
 
 
 def main() -> None:
+    # Loads .env before selecting the analyzer-specific interface.
+    load_settings()
+    requested_job = st.query_params.get("job_id")
+    if requested_job and requested_job != st.session_state.get("job_id"):
+        st.session_state.job_id = requested_job
+        st.session_state.job_status = "processing"
+        st.session_state.job_data = {}
+        st.session_state.pop("job_source_identity", None)
+        st.session_state.pop("job_filename", None)
+        st.session_state.pop("job_analysis_type", None)
     st.title("Проверка видео")
     st.write("Загрузите видео .mov, чтобы запустить локальный анализ.")
     st.caption("Видео обрабатывается локальным сервисом и не отправляется облачному AI-сервису.")
     st.info(
         "Результаты требуют проверки человеком. Интерфейс помогает найти фрагменты видео и не выносит окончательное решение."
     )
+    try:
+        readiness = get_readiness(load_settings())
+        jury_compatibility = readiness.get("jury_contract_compatible")
+        jury_label = "да" if jury_compatibility is True else "нет" if jury_compatibility is False else "неизвестна"
+        st.caption(
+            f"Режим по умолчанию API: {readiness.get('default_analysis_type')}; "
+            f"запрос без analysis_type: {readiness.get('omitted_analysis_type_routes_to')}; "
+            f"маршрут для jury: {'да' if readiness.get('configured_for_jury_contract') else 'нет'}; "
+            f"совместимость jury: {jury_label}."
+        )
+        if jury_compatibility is not True:
+            st.warning(str(readiness.get("jury_contract_basis", "Jury-совместимость не подтверждена.")))
+    except APIClientError as exc:
+        st.caption(f"Не удалось прочитать готовность API: {exc}")
 
-    with st.form("video_upload", clear_on_submit=False):
-        uploaded_file = st.file_uploader("Видео в формате .mov", type=["mov"], accept_multiple_files=False)
-        submitted = st.form_submit_button("Анализировать", type="primary")
+    real_mode = os.getenv("ANALYZER_MODE", "real").lower() == "real"
+    safe_mode = real_mode and os.getenv("ANALYZER_CALLABLE") == "src.vision.safe_classifier:analyze_video"
+    scenario_available = real_mode and bool(os.getenv("SCENARIO_MODEL_PATH", "").strip())
+    if scenario_available:
+        mode = st.radio("Режим анализа", list(scenario_view.MODE_TITLES), format_func=scenario_view.MODE_TITLES.get,
+                        horizontal=True, key="analysis_mode")
+    else:
+        mode = "safe_state" if safe_mode else "legacy"
+    st.session_state.selected_analysis_type = mode
+    if mode == "bank_scenarios":
+        scenario_view.upload(_accept_job)
+        scenario_view.comparison_report()
+    elif mode == "safe_state":
+        _safe_upload(analysis_type="safe_state")
+        _show_model_report()
+    else:
+        with st.form("video_upload", clear_on_submit=False):
+            uploaded_file = st.file_uploader("Видео в формате .mov", type=["mov"], accept_multiple_files=False)
+            submitted = st.form_submit_button("Анализировать", type="primary")
 
-    if submitted:
-        if uploaded_file is None:
-            st.error("Сначала выберите видеофайл .mov.")
-        else:
-            try:
-                response = submit_video(load_settings(), uploaded_file.name, uploaded_file.getvalue())
-                job_id = response.get("job_id")
-                if not isinstance(job_id, str) or not job_id:
-                    raise APIClientError("API не вернул идентификатор задачи.")
-                st.session_state.job_id = job_id
-                st.session_state.job_status = response.get("status", "processing")
-                st.session_state.job_data = response
-                st.session_state.job_error = "Не удалось обработать видео. Проверьте сервис и попробуйте снова."
-            except APIClientError as exc:
-                st.error(str(exc))
+        if submitted:
+            if uploaded_file is None:
+                st.error("Сначала выберите видеофайл .mov.")
+            else:
+                try:
+                    _accept_job(submit_video(load_settings(), uploaded_file.name, uploaded_file.getvalue()))
+                except APIClientError as exc:
+                    st.error(str(exc))
 
     if st.session_state.get("job_id"):
         st.divider()

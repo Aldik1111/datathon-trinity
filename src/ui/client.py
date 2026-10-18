@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 import os
@@ -84,18 +85,29 @@ def _json_object(response: requests.Response, api_key: str = "") -> dict[str, An
     return data
 
 
-def submit_video(settings: APISettings, filename: str, video_bytes: bytes) -> dict[str, Any]:
+def submit_video(
+    settings: APISettings, filename: str, video_bytes: bytes, roi: list[float] | None = None,
+    analysis_type: str | None = None,
+) -> dict[str, Any]:
     """Submit one .mov file and return the API's job response."""
     if Path(filename).suffix.lower() != ".mov":
         raise APIClientError("Поддерживаются видеофайлы в формате .mov.")
     if not video_bytes:
         raise APIClientError("Выбранный файл пуст.")
+    if analysis_type is not None and analysis_type not in ("safe_state", "bank_scenarios"):
+        raise APIClientError("Неизвестный режим анализа.")
     try:
+        # Omission preserves the original configured-analyzer request.
+        data = {"roi": json.dumps(roi)} if roi is not None else {}
+        if analysis_type is not None:
+            data["analysis_type"] = analysis_type
+        extra = {"data": data} if data else {}
         response = requests.post(
             f"{settings.base_url}/api/v1/analyze",
             headers=_headers(settings),
             files={"file": (Path(filename).name, video_bytes, "video/quicktime")},
             timeout=UPLOAD_TIMEOUT,
+            **extra,
         )
     except requests.Timeout as exc:
         raise APIClientError("Сервис не ответил за отведённое время. Попробуйте ещё раз.") from exc
@@ -118,6 +130,21 @@ def get_job(settings: APISettings, job_id: str) -> dict[str, Any]:
         raise APIClientError("Истекло время ожидания ответа API. Обновление повторится автоматически.") from exc
     except requests.RequestException as exc:
         raise APIClientError("Не удалось получить состояние задачи. Проверьте, что локальный API запущен.") from exc
+    return _json_object(response, settings.api_key)
+
+
+def get_readiness(settings: APISettings) -> dict[str, Any]:
+    """Fetch the API's configured routing and contract readiness summary."""
+    try:
+        response = requests.get(
+            f"{settings.base_url}/api/v1/readiness",
+            headers=_headers(settings),
+            timeout=POLL_TIMEOUT,
+        )
+    except requests.Timeout as exc:
+        raise APIClientError("Истекло время ожидания ответа API.") from exc
+    except requests.RequestException as exc:
+        raise APIClientError("Не удалось получить готовность API. Проверьте, что локальный API запущен.") from exc
     return _json_object(response, settings.api_key)
 
 

@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from .contracts import AnalysisResult, Event, EvidenceFrame
+from .scenario_contracts import ANALYSIS_CALLABLES, SCENARIO_TYPES
 
 
 class AnalysisError(ValueError):
@@ -72,10 +73,50 @@ def load_rules(path: str | None) -> dict:
 def normalize_result(raw: Any, duration: float, rules: dict) -> dict:
     result = _mapping(raw)
     verdict, events = result.get("verdict"), result.get("events")
-    if verdict not in {"violation", "no_violation"} or not isinstance(events, list):
+    scoped = result.get("analysis_scope") == "safe_state"
+    scenario = result.get("analysis_scope") == "bank_scenarios"
+    allowed = ({"review_required", "no_candidate"} if scenario else
+               {"review_required", "no_event"} if scoped else {"violation", "no_violation"})
+    if not isinstance(verdict, str) or verdict not in allowed or not isinstance(events, list):
         raise AnalysisError("Model result does not match the integration contract")
-    if (verdict == "violation") != bool(events) or len(events) > 100:
+    if (verdict in {"violation", "review_required"}) != bool(events) or len(events) > 100:
         raise AnalysisError("Model verdict is inconsistent with its events")
+    extra = {}
+    if scenario:
+        extra = _scenario_metadata(result, events, duration)
+    if scoped:
+        observations = result.get("observations")
+        if not isinstance(observations, list) or not 1 <= len(observations) <= 1200:
+            raise AnalysisError("Safe analysis requires sampled observations")
+        cleaned = []
+        for observation in observations:
+            if not isinstance(observation, dict) or observation.get("state") not in {"open", "closed", "unknown"}:
+                raise AnalysisError("Invalid safe state observation")
+            confidence = _confidence(observation.get("confidence"))
+            timestamp = _number(observation.get("timecode_sec"), duration)
+            if cleaned and timestamp < cleaned[-1]["timecode_sec"]:
+                raise AnalysisError("Observations must be in time order")
+            cleaned.append({"timecode_sec": timestamp, "state": observation["state"], "confidence": confidence})
+        if (verdict == "no_event") != all(item["state"] == "closed" for item in cleaned):
+            raise AnalysisError("Safe verdict is inconsistent with sampled observations")
+        summary = result.get("summary")
+        if isinstance(summary, dict):
+            counts = {state: sum(item["state"] == state for item in cleaned) for state in ("open", "closed", "unknown")}
+            if summary.get("sample_count") != len(cleaned) or summary.get("state_counts") != counts:
+                raise AnalysisError("Summary does not match sampled observations")
+            sample_fps = summary.get("sample_fps")
+            if isinstance(sample_fps, bool) or not isinstance(sample_fps, (int, float)) or not math.isfinite(sample_fps) or not 0 < sample_fps <= 30:
+                raise AnalysisError("Invalid sampling frequency")
+            if not isinstance(summary.get("events_truncated"), bool):
+                raise AnalysisError("Invalid event truncation flag")
+            if summary.get("score_semantics") != "uncalibrated_model_score":
+                raise AnalysisError("Invalid model score semantics")
+            summary = {"sample_count": len(cleaned), "state_counts": counts, "sample_fps": sample_fps,
+                       "events_truncated": summary["events_truncated"], "score_semantics": "uncalibrated_model_score"}
+        else:
+            summary = _text(summary)
+        extra = {"analysis_scope": "safe_state", "model_version": _text(result.get("model_version")),
+                 "summary": summary, "observations": cleaned}
     violations = []
     for raw_event in events:
         event = _mapping(raw_event)
@@ -108,8 +149,120 @@ def normalize_result(raw: Any, duration: float, rules: dict) -> dict:
             raise AnalysisError("Invalid rule identifier")
         violation["rule"] = rules.get(rule_id)
         violation["rule_status"] = "verified" if rule_id in rules else "unverified"
+        if scoped or scenario:
+            start = _number(event.get("start_sec"), duration)
+            end = _number(event.get("end_sec"), duration)
+            if not start <= violation["timecode_sec"] <= end:
+                raise AnalysisError("Invalid event interval")
+            violation.update(start_sec=start, end_sec=end, confidence=_confidence(event.get("confidence")))
         violations.append(violation)
-    return {"verdict": verdict, "violations": violations}
+    return {"verdict": verdict, "violations": violations, **extra}
+
+
+def _confidence(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise AnalysisError("Invalid model confidence")
+    return float(value)
+
+
+def _count(value: Any, maximum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or (maximum is not None and value > maximum):
+        raise AnalysisError("Invalid scenario sample or support count")
+    return value
+
+
+def _scenario_metadata(result: dict, events: list, duration: float) -> dict:
+    """Validate partial-support candidate scores without asserting a violation."""
+    if result.get("score_semantics") != "uncalibrated_model_score":
+        raise AnalysisError("Invalid model score semantics")
+    policy = result.get("model_support_policy", {"min_positive_media_groups": 1, "min_negative_media_groups": 1})
+    if (not isinstance(policy, dict)
+            or set(policy) != {"min_positive_media_groups", "min_negative_media_groups"}
+            or type(policy.get("min_positive_media_groups")) is not int
+            or policy["min_positive_media_groups"] not in (1, 2)
+            or type(policy.get("min_negative_media_groups")) is not int
+            or policy["min_negative_media_groups"] != 1):
+        raise AnalysisError("Invalid scenario support policy")
+    classes = result.get("class_results")
+    if not isinstance(classes, list) or not 1 <= len(classes) <= 50:
+        raise AnalysisError("Scenario analysis requires class results")
+    cleaned, seen, candidates = [], set(), set()
+    for row in classes:
+        if not isinstance(row, dict):
+            raise AnalysisError("Invalid scenario class result")
+        event_type = _text(row.get("type"))
+        if event_type not in SCENARIO_TYPES or event_type in seen:
+            raise AnalysisError("Unknown or duplicate scenario type")
+        seen.add(event_type)
+        threshold = _confidence(row.get("threshold"))
+        positive = _count(row.get("positive_groups"))
+        negative = _count(row.get("negative_groups"))
+        decision = row.get("decision")
+        if not isinstance(decision, str) or decision not in {"candidate", "not_flagged", "unsupported"}:
+            raise AnalysisError("Invalid scenario decision")
+        supported = positive >= policy["min_positive_media_groups"] and negative >= policy["min_negative_media_groups"]
+        if (decision != "unsupported") != supported:
+            raise AnalysisError("Scenario decision contradicts model support")
+        score, peak = row.get("score"), row.get("peak_sec")
+        if not supported:
+            if score is not None or peak is not None:
+                raise AnalysisError("Unsupported scenarios require null scores and times")
+        else:
+            score, peak = _confidence(score), _number(peak, duration)
+            if (decision == "candidate") != (score >= threshold):
+                raise AnalysisError("Scenario decision contradicts its threshold")
+        if decision == "candidate":
+            candidates.add(event_type)
+        cleaned.append({"type": event_type, "title": _text(row.get("title")),
+                        "score": score, "threshold": threshold, "decision": decision,
+                        "positive_groups": positive, "negative_groups": negative, "peak_sec": peak})
+    event_types = {_text(_mapping(event).get("event_type")) for event in events}
+    if event_types != candidates or (result["verdict"] == "review_required") != bool(candidates):
+        raise AnalysisError("Scenario candidates, events, and verdict are inconsistent")
+    limitations = result.get("limitations")
+    if not isinstance(limitations, list) or not 1 <= len(limitations) <= 50:
+        raise AnalysisError("Scenario analysis requires bounded limitations")
+    summary = result.get("summary")
+    if not isinstance(summary, dict) or not 1 <= _count(summary.get("sample_count"), 1200):
+        raise AnalysisError("Scenario analysis requires sampled frames")
+    sample_fps = summary.get("sample_fps")
+    if isinstance(sample_fps, bool) or not isinstance(sample_fps, (int, float)) or not math.isfinite(sample_fps) or not 0 < sample_fps <= 30:
+        raise AnalysisError("Invalid sampling frequency")
+    if not isinstance(summary.get("events_truncated"), bool):
+        raise AnalysisError("Invalid event truncation flag")
+    return {"analysis_scope": "bank_scenarios", "model_version": _text(result.get("model_version")),
+            "feature_version": _text(result.get("feature_version")),
+            "score_semantics": "uncalibrated_model_score", "class_results": cleaned,
+            "model_support_policy": dict(policy),
+            "limitations": [_text(value) for value in limitations],
+            "summary": {"sample_count": summary["sample_count"], "sample_fps": float(sample_fps),
+                        "events_truncated": summary["events_truncated"]}}
+
+
+def _selected_analyzer(video_path: str, settings: Any) -> tuple[str, str | None]:
+    """Read only a private allowlisted selection; paths remain server-owned."""
+    sidecar = Path(str(video_path) + ".analysis.json")
+    try:
+        encoded = sidecar.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return getattr(settings, "analyzer_callable", ""), getattr(settings, "model_path", None)
+    except (OSError, UnicodeError):
+        raise AnalysisError("Cannot read the selected analysis type") from None
+    try:
+        selection = json.loads(encoded) if len(encoded) <= 256 else None
+        if not isinstance(selection, dict) or set(selection) != {"analysis_type"}:
+            raise ValueError
+        analysis_type = selection["analysis_type"]
+        if not isinstance(analysis_type, str) or analysis_type not in ANALYSIS_CALLABLES:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise AnalysisError("Invalid selected analysis type") from None
+    if settings.analyzer_mode != "real":
+        raise AnalysisError("Analyzer selection requires real mode")
+    model_path = getattr(settings, "scenario_model_path", None) if analysis_type == "bank_scenarios" else settings.model_path
+    if not model_path:
+        raise AnalysisError("Selected local model is not configured")
+    return ANALYSIS_CALLABLES[analysis_type], model_path
 
 
 def inspect_video(path: str) -> tuple[float, bytes]:
@@ -155,6 +308,7 @@ def inspect_video(path: str) -> tuple[float, bytes]:
 
 
 def run_analysis(video_path: str, settings: Any) -> dict:
+    analyzer_callable, model_path = _selected_analyzer(video_path, settings)
     duration, first_jpeg = inspect_video(str(video_path))
     if settings.analyzer_mode == "demo":
         # This deliberately synthetic event tests plumbing, not recognition.
@@ -168,10 +322,10 @@ def run_analysis(video_path: str, settings: Any) -> dict:
     else:
         # The model's stable public signature remains analyze_video(video_path).
         # Its optional local weight location is supplied through the environment.
-        if settings.model_path:
-            os.environ["MODEL_PATH"] = str(settings.model_path)
+        if model_path:
+            os.environ["MODEL_PATH"] = str(model_path)
         try:
-            module_name, function_name = settings.analyzer_callable.split(":", 1)
+            module_name, function_name = analyzer_callable.split(":", 1)
             analyzer = getattr(importlib.import_module(module_name), function_name)
         except (ValueError, ImportError, AttributeError):
             raise AnalysisError("Local model is not installed. Configure ANALYZER_CALLABLE and MODEL_PATH") from None
