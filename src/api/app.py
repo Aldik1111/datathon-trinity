@@ -34,11 +34,12 @@ _EXPERIMENTAL_ANALYZERS = {
 class ApiRequestGuard:
     """Authenticate before parsing multipart bodies and cap the full request."""
 
-    def __init__(self, app, api_key: str, max_body_bytes: int):
+    def __init__(self, app, api_key: str, max_body_bytes: int, timeout_sec: float = 300):
         self.app = app
         self.api_key = api_key
         # Allow modest multipart headers/boundaries around the uploaded file.
         self.max_body_bytes = max_body_bytes + 64 * 1024
+        self.timeout_sec = timeout_sec
 
     async def _reject(self, scope, receive, send, status: int, message: str) -> None:
         response = JSONResponse(status_code=status, content={"detail": message})
@@ -56,6 +57,8 @@ class ApiRequestGuard:
         if scope.get("method") != "POST" or scope.get("path") != "/api/v1/analyze":
             await self.app(scope, receive, send)
             return
+        scope["analysis_request_started_at"] = time.time()
+        deadline = time.monotonic() + self.timeout_sec
         raw_length = headers.get(b"content-length")
         if raw_length:
             try:
@@ -68,7 +71,11 @@ class ApiRequestGuard:
         with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as body:
             total = 0
             while True:
-                message = await receive()
+                try:
+                    message = await asyncio.wait_for(receive(), max(0., deadline - time.monotonic()))
+                except TimeoutError:
+                    await self._reject(scope, receive, send, 408, "Upload exceeded the analysis deadline")
+                    return
                 if message["type"] == "http.disconnect":
                     return
                 chunk = message.get("body", b"")
@@ -144,9 +151,13 @@ def _initialize(settings: Settings) -> None:
                 updated_at REAL NOT NULL,
                 result_json TEXT,
                 error TEXT,
-                demo INTEGER NOT NULL DEFAULT 0
+                demo INTEGER NOT NULL DEFAULT 0,
+                analysis_type TEXT
             )"""
         )
+        # Additive migration preserves completed legacy jobs and user state.
+        if "analysis_type" not in {column["name"] for column in db.execute("PRAGMA table_info(jobs)")}:
+            db.execute("ALTER TABLE jobs ADD COLUMN analysis_type TEXT")
         # A worker is deliberately single-process. If the server stopped while
         # analyzing, the job cannot safely be resumed from an unknown model state.
         interrupted = db.execute(
@@ -202,59 +213,96 @@ def _run_child(
     recv_conn, send_conn = ctx.Pipe(duplex=False)
     process = ctx.Process(target=_child_analyze, args=(send_conn, video_path, settings))
     deadline = time.monotonic() + max(0.0, timeout_sec)
-    process.start()
-    send_conn.close()
+    received: dict[str, Any] = {}
+    message_ready = threading.Event()
+    reader = None
+    started = False
+
+    def receive_message() -> None:
+        # poll() only establishes that some bytes are available. recv() can
+        # still block on an unfinished message or during deserialization.
+        try:
+            received["message"] = recv_conn.recv()
+        except Exception:
+            received["error"] = True
+        finally:
+            message_ready.set()
+
     try:
-        while time.monotonic() < deadline:
-            if recv_conn.poll(0.1):
-                if time.monotonic() >= deadline:
-                    process.terminate()
-                    process.join(timeout=3)
-                    if process.is_alive():
-                        process.kill()
-                        process.join(timeout=3)
-                    raise TimeoutError("Analysis exceeded the job deadline")
-                ok, payload = recv_conn.recv()
-                process.join(timeout=1)
-                if not ok:
-                    raise SafeAnalysisFailure(payload.get("message", "Analysis failed"))
-                if not isinstance(payload, dict):
-                    raise RuntimeError("Analyzer returned an invalid result")
-                return payload
-            if not process.is_alive():
-                process.join()
-                if recv_conn.poll():
-                    ok, payload = recv_conn.recv()
-                    if ok and isinstance(payload, dict):
-                        return payload
-                    raise SafeAnalysisFailure(
-                        payload.get("message", "Analysis failed")
-                        if isinstance(payload, dict)
-                        else "Analysis failed"
-                    )
-                raise RuntimeError("Analyzer exited without a result")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Analysis exceeded the job deadline")
+        process.start()
+        started = True
+        send_conn.close()
+        # Process creation and the complete send/receive are inside the same
+        # budget. The controlling thread never performs a blocking pipe read.
+        reader = threading.Thread(target=receive_message, name="analysis-pipe-reader", daemon=True)
+        reader.start()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Analysis exceeded the job deadline")
             if stop_event is not None and stop_event.is_set():
-                process.terminate()
-                process.join(timeout=3)
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=3)
                 raise RuntimeError("Analysis stopped")
-        process.terminate()
-        process.join(timeout=3)
-        if process.is_alive():
-            process.kill()
-            process.join(timeout=3)
-        raise TimeoutError("Analysis exceeded the 300 second job deadline")
+            if not message_ready.wait(min(.05, remaining)):
+                continue
+            # Also reject a result that arrived as the deadline expired, even
+            # when its producing process has already exited.
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Analysis exceeded the job deadline")
+            if received.get("error") or "message" not in received:
+                raise RuntimeError("Analyzer exited without a complete result")
+            message = received["message"]
+            if not isinstance(message, tuple) or len(message) != 2:
+                raise RuntimeError("Analyzer returned an invalid result")
+            ok, payload = message
+            if not ok:
+                raise SafeAnalysisFailure(payload.get("message", "Analysis failed")
+                                          if isinstance(payload, dict) else "Analysis failed")
+            if not isinstance(payload, dict):
+                raise RuntimeError("Analyzer returned an invalid result")
+            return payload
     finally:
-        recv_conn.close()
-        if process.is_alive():
+        send_conn.close()
+        if started and process.is_alive():
             process.terminate()
-            process.join(timeout=3)
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1)
+        elif started:
+            process.join(timeout=0)
+        recv_conn.close()
+        if reader is not None:
+            reader.join(timeout=.1)
 
 
-def _public_result(job_id: str, result_json: str | None, demo: int) -> dict[str, Any]:
+def _jury_result_is_compatible(result: dict[str, Any], *, require_scenarios: bool = False) -> bool:
+    if result.get("verdict") not in {"violation", "no_violation"}:
+        return False
+    if result.get("analysis_scope") is None and not require_scenarios:
+        return True  # Historical custom analyzers and the explicit demo contract.
+    provenance = result.get("provenance")
+    return (
+        result.get("analysis_scope") == "bank_scenarios"
+        and result.get("output_contract") == "jury-v1"
+        and result.get("jury_policy") == "scenario-threshold-v1"
+        and result.get("demo") is False
+        and isinstance(provenance, dict)
+        and provenance.get("actual_analyzer") == ANALYSIS_CALLABLES["bank_scenarios"]
+    )
+
+
+def _scenario_files_present(settings: Settings) -> bool:
+    directory = Path(settings.scenario_model_path) if settings.scenario_model_path else None
+    return directory is not None and all((directory / name).is_file()
+                                        for name in ("model.npz", "metadata.json", "backbone.onnx"))
+
+
+def _public_result(job_id: str, result_json: str | None, demo: int, analysis_type: str | None = None) -> dict[str, Any]:
     payload = json.loads(result_json or "{}")
+    if analysis_type == "jury" and not _jury_result_is_compatible(payload):
+        raise SafeAnalysisFailure("Saved result does not match the jury contract")
     verdict = payload.get("verdict")
     if verdict not in {"violation", "no_violation", "review_required", "no_event", "no_candidate"}:
         raise RuntimeError("Analyzer returned an invalid verdict")
@@ -293,7 +341,9 @@ def _public_result(job_id: str, result_json: str | None, demo: int) -> dict[str,
     }
     # Ruleset metadata is safe to expose and useful to clients when supplied.
     for key in ("ruleset_version", "ruleset_hash", "model_version", "analysis_scope", "summary", "observations",
-                "feature_version", "score_semantics", "class_results", "limitations", "model_support_policy"):
+                "feature_version", "score_semantics", "class_results", "limitations", "model_support_policy",
+                "output_contract", "jury_policy", "internal_verdict", "provenance", "coverage",
+                "video_duration_sec", "rules_status"):
         if key in payload:
             response[key] = payload[key]
     for key in ("rule", "rule_metadata", "ruleset"):
@@ -323,7 +373,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     ).fetchone()
                     if row is None or row["status"] != "processing":
                         continue
-                    remaining = configured.analyzer_timeout_sec - (
+                    remaining = configured.analyzer_timeout_sec - configured.shutdown_reserve_sec - (
                         time.time() - row["created_at"]
                     )
                     if remaining <= 0:
@@ -346,15 +396,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )["analysis_type"]
                 except (OSError, ValueError, KeyError, TypeError):
                     raise SafeAnalysisFailure("Analysis mode metadata is unavailable") from None
-                if api_mode == "jury" and (
-                    result.get("analysis_scope") is not None
-                    or result.get("verdict") not in {"violation", "no_violation"}
+                if api_mode != row["analysis_type"]:
+                    raise SafeAnalysisFailure("Analysis mode metadata does not match the saved job")
+                if api_mode == "jury" and not _jury_result_is_compatible(
+                    result, require_scenarios=configured.jury_analyzer == "bank_scenarios"
                 ):
                     raise SafeAnalysisFailure(
                         "Configured analyzer is not jury-compatible; select an explicit experimental mode"
                     )
                 demo = bool(result.get("demo", configured.analyzer_mode == "demo"))
-                encoded = json.dumps(result, ensure_ascii=False)
+                encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
+                if time.time() >= row["created_at"] + configured.analyzer_timeout_sec:
+                    raise TimeoutError("Analysis exceeded the job deadline")
                 with _connect(configured) as db:
                     db.execute(
                         "UPDATE jobs SET status='done', result_json=?, demo=?, error=NULL, updated_at=? WHERE job_id=? AND status='processing'",
@@ -428,6 +481,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ApiRequestGuard,
         api_key=configured.api_key,
         max_body_bytes=configured.max_upload_mb * 1024 * 1024,
+        timeout_sec=configured.analyzer_timeout_sec - configured.shutdown_reserve_sec,
     )
 
     def require_key(x_api_key: str | None) -> None:
@@ -453,23 +507,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         inferred_default = (_EXPERIMENTAL_ANALYZERS.get(configured.analyzer_callable, "jury")
                             if configured.analyzer_mode == "real" else "jury")
         selected_type = analysis_type or configured.default_analysis_type or inferred_default
+        jury_scenarios = selected_type == "jury" and configured.jury_analyzer == "bank_scenarios"
         explicit_route = analysis_type is not None or configured.default_analysis_type is not None
         if selected_type != "jury" and configured.analyzer_mode != "real":
             raise HTTPException(status_code=422, detail="Analyzer selection requires real mode")
         if (selected_type == "jury" and configured.analyzer_mode == "real"
-                and configured.analyzer_callable in _EXPERIMENTAL_ANALYZERS):
+                and configured.analyzer_callable in _EXPERIMENTAL_ANALYZERS and not jury_scenarios):
             raise HTTPException(
                 status_code=409,
                 detail="The configured analyzer is experimental and cannot serve the jury verdict contract; choose an explicit experimental mode or configure a jury-compatible analyzer",
             )
         needs_roi = selected_type == "safe_state" or (
-            selected_type == "jury" and configured.analyzer_mode == "real"
+            selected_type == "jury" and not jury_scenarios and configured.analyzer_mode == "real"
             and configured.analyzer_callable == ANALYSIS_CALLABLES["safe_state"]
         )
         selected_roi = _parse_roi(roi, needs_roi)
         _cleanup_expired(configured)
         if not file.filename or Path(file.filename).suffix.lower() != ".mov":
             raise HTTPException(status_code=415, detail="Only .mov files are accepted")
+        if jury_scenarios and not _scenario_files_present(configured):
+            raise HTTPException(status_code=503, detail="Jury scenario model files are missing; configure the local scenario model")
         queue: asyncio.Queue[str] = state["queue"]
         if queue is None:
             raise HTTPException(status_code=503, detail="Analysis queue is full")
@@ -498,9 +555,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail="Uploaded file is empty")
             if selected_roi is not None:
                 Path(str(target) + ".roi.json").write_text(json.dumps({"roi": selected_roi}), encoding="utf-8")
-            if selected_type != "jury" and explicit_route:
+            if jury_scenarios or (selected_type != "jury" and explicit_route):
                 Path(str(target) + ".analysis.json").write_text(
-                    json.dumps({"analysis_type": selected_type}), encoding="utf-8"
+                    json.dumps({"analysis_type": "bank_scenarios" if jury_scenarios else selected_type}), encoding="utf-8"
                 )
             Path(str(target) + ".api-mode.json").write_text(
                 json.dumps({"analysis_type": selected_type}), encoding="utf-8"
@@ -516,16 +573,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             async with lock:
                 now = time.time()
+                started_at = request.scope.get("analysis_request_started_at", now)
+                if now >= started_at + configured.analyzer_timeout_sec - configured.shutdown_reserve_sec:
+                    raise HTTPException(status_code=408, detail="Upload exceeded the analysis deadline")
                 with _connect(configured) as db:
                     db.execute(
-                        "INSERT INTO jobs(job_id,status,video_path,created_at,updated_at,demo) VALUES(?,?,?,?,?,?)",
+                        "INSERT INTO jobs(job_id,status,video_path,created_at,updated_at,demo,analysis_type) VALUES(?,?,?,?,?,?,?)",
                         (
                             job_id,
                             "processing",
                             str(target),
-                            now,
+                            started_at,
                             now,
                             int(configured.analyzer_mode == "demo"),
+                            selected_type,
                         ),
                     )
                 try:
@@ -557,7 +618,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if row is None:
             raise HTTPException(status_code=404, detail="Job not found")
         if row["status"] == "done":
-            return _public_result(row["job_id"], row["result_json"], row["demo"])
+            try:
+                return _public_result(row["job_id"], row["result_json"], row["demo"], row["analysis_type"])
+            except (ValueError, RuntimeError, TypeError):
+                with _connect(configured) as db:
+                    db.execute("UPDATE jobs SET status='failed', result_json=NULL, error=?, updated_at=? WHERE job_id=?",
+                               ("Saved result does not match the job contract", time.time(), job_id))
+                return {"job_id": job_id, "status": "failed", "demo": bool(row["demo"]),
+                        "error": "Saved result does not match the job contract"}
         response: dict[str, Any] = {
             "job_id": row["job_id"],
             "status": row["status"],
@@ -571,6 +639,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def readiness(x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
         """Report routing and declared contract readiness without loading a model."""
         require_key(x_api_key)
+        if configured.jury_analyzer == "bank_scenarios":
+            present = _scenario_files_present(configured)
+            return {
+                "api_configured": True, "model_configured": bool(configured.scenario_model_path),
+                "model_files_present": present, "model_load_verified": False,
+                "analyzer_mode": "real", "default_analysis_type": "jury",
+                "omitted_analysis_type_routes_to": "bank_scenarios", "actual_analysis_type": "bank_scenarios",
+                "actual_analyzer": ANALYSIS_CALLABLES["bank_scenarios"],
+                "configured_for_jury_contract": True, "jury_contract_compatible": None,
+                "jury_contract_basis": "Jury projection is configured; each real result must pass runtime policy and evidence validation. Model loading and recognition quality are not certified by this endpoint.",
+                "readiness_error": None if present else "Jury scenario model files are missing",
+                "analysis_timeout_sec": configured.analyzer_timeout_sec,
+                "maximum_analysis_deadline_sec": 300,
+                "deadline_starts_at": "HTTP POST body reception",
+                "shutdown_reserve_sec": configured.shutdown_reserve_sec,
+                "analysis_work_budget_sec": configured.analyzer_timeout_sec - configured.shutdown_reserve_sec,
+                "experimental_modes": ["safe_state", "bank_scenarios"],
+            }
         configured_experimental = _EXPERIMENTAL_ANALYZERS.get(configured.analyzer_callable)
         default_mode = configured.default_analysis_type or (configured_experimental if configured.analyzer_mode == "real" else None) or "jury"
         effective_mode = (

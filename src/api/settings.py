@@ -26,6 +26,8 @@ class Settings:
     # Preserve the historical configured-analyzer route unless an operator opts
     # into one of the experimental analyzers as the default.
     default_analysis_type: str | None = None
+    # An explicit server profile, separate from the legacy experimental routes.
+    jury_analyzer: str | None = None
 
     def __post_init__(self) -> None:
         if not self.api_key:
@@ -36,6 +38,10 @@ class Settings:
             raise ValueError("ANALYZER_MODE must be 'demo' or 'real'")
         if self.default_analysis_type not in {None, "jury", "safe_state", "bank_scenarios"}:
             raise ValueError("DEFAULT_ANALYSIS_TYPE must be jury, safe_state, or bank_scenarios")
+        if self.jury_analyzer not in {None, "bank_scenarios"}:
+            raise ValueError("JURY_ANALYZER must be bank_scenarios")
+        if self.jury_analyzer and (self.analyzer_mode != "real" or self.default_analysis_type != "jury"):
+            raise ValueError("JURY_ANALYZER requires ANALYZER_MODE=real and DEFAULT_ANALYSIS_TYPE=jury")
         if not 1 <= self.analyzer_timeout_sec <= 300:
             raise ValueError("ANALYZER_TIMEOUT_SEC must be between 1 and 300")
         if self.max_pending_jobs < 1:
@@ -46,6 +52,11 @@ class Settings:
     @property
     def database_path(self) -> Path:
         return self.db_path or self.upload_dir / "jobs.sqlite3"
+
+    @property
+    def shutdown_reserve_sec(self) -> float:
+        """Leave time to stop a child and persist the terminal job state."""
+        return min(5.0, self.analyzer_timeout_sec * 0.1)
 
 
 def get_settings() -> Settings:
@@ -61,6 +72,7 @@ def get_settings() -> Settings:
         model_path=os.getenv("MODEL_PATH") or None,
         scenario_model_path=os.getenv("SCENARIO_MODEL_PATH") or None,
         default_analysis_type=(os.getenv("DEFAULT_ANALYSIS_TYPE", "").strip().lower() or None),
+        jury_analyzer=(os.getenv("JURY_ANALYZER", "").strip().lower() or None),
         analyzer_mode=os.getenv("ANALYZER_MODE", "real").lower(),
         analyzer_callable=os.getenv(
             "ANALYZER_CALLABLE", "src.vision.analyzer:analyze_video"
